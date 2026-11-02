@@ -6256,9 +6256,9 @@ fn retrieved_ids(db: &Database) -> (Vec<String>, Vec<String>) {
     (keyword, vector)
 }
 
-/// A message the user trashed, or marked as junk, must not come back as a
-/// retrieval candidate by keyword or by meaning; taking the junk mark back
-/// makes it retrievable again, a trashed one stays out.
+/// Legacy vectors have no verified profile and stay unavailable throughout.
+/// Keyword fallback must exclude trashed/junk mail, restore an un-junked message,
+/// and continue excluding the trashed message.
 #[tokio::test]
 async fn retrieval_leaves_out_trashed_and_junk_marked_messages() {
     let db = test_db();
@@ -6273,8 +6273,8 @@ async fn retrieval_leaves_out_trashed_and_junk_marked_messages() {
     let all = vec!["r-junk".to_string(), "r-live".to_string(), "r-trashed".to_string()];
     assert_eq!(
         retrieved_ids(&db),
-        (all.clone(), all),
-        "all three are candidates at first"
+        (all, Vec::new()),
+        "all three remain keyword candidates; unverified legacy vectors stay unavailable"
     );
 
     db.delete_email("r-trashed").unwrap();
@@ -6282,13 +6282,21 @@ async fn retrieval_leaves_out_trashed_and_junk_marked_messages() {
         .await
         .unwrap();
     let live = vec!["r-live".to_string()];
-    assert_eq!(retrieved_ids(&db), (live.clone(), live));
+    assert_eq!(
+        retrieved_ids(&db),
+        (live, Vec::new()),
+        "keyword fallback excludes deleted/junk mail without enabling legacy vectors"
+    );
 
     emailops_lib::services::junk::set_feedback(&db, "acc-ret", "r-junk", false)
         .await
         .unwrap();
     let restored = vec!["r-junk".to_string(), "r-live".to_string()];
-    assert_eq!(retrieved_ids(&db), (restored.clone(), restored));
+    assert_eq!(
+        retrieved_ids(&db),
+        (restored, Vec::new()),
+        "un-junk restores keyword access; trashed mail and legacy semantic hits remain excluded"
+    );
 }
 
 // ── Junk feedback: the chip and the company views ───────────────────────────

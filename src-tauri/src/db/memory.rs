@@ -911,6 +911,18 @@ impl Database {
         account_id: &str,
         limit: i32,
     ) -> Result<Vec<(MemoryFact, f32)>> {
+        if !self.legacy_embedding_search_available()? {
+            return Ok(Vec::new());
+        }
+        self.vec_search_memory_facts_legacy(query_embedding, account_id, limit)
+    }
+
+    fn vec_search_memory_facts_legacy(
+        &self,
+        query_embedding: &[f32],
+        account_id: &str,
+        limit: i32,
+    ) -> Result<Vec<(MemoryFact, f32)>> {
         let blob = fact_embedding_to_blob(query_embedding);
         // Stage 1: KNN on vec_memory_facts, pre-filtered to this account's
         // non-retired facts (as `vec_search` does for emails) so other
@@ -1440,7 +1452,7 @@ mod tests {
             .unwrap();
         db.upsert_fact_embedding("mine", &fact_emb(1.0), "m").unwrap();
 
-        let hits = db.vec_search_memory_facts(&fact_emb(0.0), "a1", 1).unwrap();
+        let hits = db.vec_search_memory_facts_legacy(&fact_emb(0.0), "a1", 1).unwrap();
         let ids: Vec<&str> = hits.iter().map(|(f, _)| f.id.as_str()).collect();
         assert_eq!(ids, vec!["mine"]);
     }

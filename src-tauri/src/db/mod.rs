@@ -18,6 +18,7 @@ pub mod calendars;
 pub mod chat;
 pub mod drafts;
 pub mod emails;
+pub mod embedding_generations;
 pub mod embeddings;
 pub mod filters;
 pub mod folders;
@@ -152,6 +153,10 @@ pub(crate) fn latest_tagged_in_thread_sql(alias: &str, tag_type_idx: usize, enab
     )
 }
 
+pub(crate) fn ai_processing_cutoff(days: i64, now_unix_seconds: i64) -> Option<i64> {
+    (days > 0).then(|| now_unix_seconds.saturating_sub(days.saturating_mul(86_400)))
+}
+
 impl Database {
     pub fn new(data_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&data_dir)
@@ -215,6 +220,11 @@ impl Database {
         timed!("configure_read_connection", db.configure_read_connection()?);
         timed!("run_migrations", db.run_migrations()?);
         timed!("ensure_virtual_tables", db.ensure_virtual_tables()?);
+        timed!("recover_embedding_generations", db.recover_embedding_generations()?);
+        timed!(
+            "check_embedding_generation_health",
+            db.check_embedding_generation_health()?
+        );
         timed!("populate_fts_if_empty", db.populate_fts_if_empty()?);
         timed!("index_emails_missing_from_fts", db.index_emails_missing_from_fts()?);
         // Integrity check removed — WAL mode is crash-safe and the check was
@@ -612,7 +622,8 @@ impl Database {
     pub fn set_preference(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.connection();
         conn.execute(
-            "INSERT OR REPLACE INTO user_preferences (key, value) VALUES (?1, ?2)",
+            "INSERT INTO user_preferences (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE user_preferences.value IS NOT excluded.value",
             rusqlite::params![key, value],
         )?;
         Ok(())
@@ -716,7 +727,7 @@ impl Database {
                 return Ok(None);
             }
         }
-        Ok(Some(now_unix_seconds.saturating_sub(days.saturating_mul(86_400))))
+        Ok(ai_processing_cutoff(days, now_unix_seconds))
     }
 
     /// Remove a stored preference. Idempotent — clearing an already-absent

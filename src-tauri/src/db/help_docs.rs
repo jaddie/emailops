@@ -185,6 +185,19 @@ impl Database {
         limit: usize,
         page: Option<&str>,
     ) -> Result<Vec<(i64, f32)>> {
+        if !self.legacy_embedding_search_available()? {
+            return Ok(Vec::new());
+        }
+        self.vec_search_help_docs_legacy(embedding, model, limit, page)
+    }
+
+    fn vec_search_help_docs_legacy(
+        &self,
+        embedding: &[f32],
+        model: &str,
+        limit: usize,
+        page: Option<&str>,
+    ) -> Result<Vec<(i64, f32)>> {
         let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT rowid, distance FROM vec_help_docs
@@ -374,10 +387,10 @@ mod tests {
         assert!(db.list_help_chunks_needing_embedding("m1", 10).unwrap().is_empty());
         assert_eq!(db.list_help_chunks_needing_embedding("m2", 10).unwrap().len(), 3);
 
-        let hits = db.vec_search_help_docs(&v, "m1", 5, None).unwrap();
+        let hits = db.vec_search_help_docs_legacy(&v, "m1", 5, None).unwrap();
         assert_eq!(hits.len(), 3);
         assert!((hits[0].1 - 1.0).abs() < 1e-4, "identical vector → similarity 1");
-        assert!(db.vec_search_help_docs(&v, "m2", 5, None).unwrap().is_empty());
+        assert!(db.vec_search_help_docs_legacy(&v, "m2", 5, None).unwrap().is_empty());
     }
 
     /// The query planner names the guide page on an app-help turn; both
@@ -417,9 +430,11 @@ mod tests {
         for (rowid, _) in db.list_help_chunks_needing_embedding("m1", 10).unwrap() {
             db.upsert_help_chunk_embedding(rowid, &v, "m1").unwrap();
         }
-        assert_eq!(db.vec_search_help_docs(&v, "m1", 5, None).unwrap().len(), 2);
+        assert_eq!(db.vec_search_help_docs_legacy(&v, "m1", 5, None).unwrap().len(), 2);
         assert_eq!(
-            db.vec_search_help_docs(&v, "m1", 5, Some("ai-features")).unwrap().len(),
+            db.vec_search_help_docs_legacy(&v, "m1", 5, Some("ai-features"))
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -446,7 +461,7 @@ mod tests {
         b[1] = 1.0;
         db.upsert_help_chunk_embedding(rowid, &a, "m1").unwrap();
         db.upsert_help_chunk_embedding(rowid, &b, "m1").unwrap();
-        let hits = db.vec_search_help_docs(&b, "m1", 5, None).unwrap();
+        let hits = db.vec_search_help_docs_legacy(&b, "m1", 5, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert!((hits[0].1 - 1.0).abs() < 1e-4);
     }

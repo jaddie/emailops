@@ -96,6 +96,19 @@ impl Database {
         categories: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<(String, f32)>> {
+        if !self.legacy_embedding_search_available()? {
+            return Ok(Vec::new());
+        }
+        self.vec_search_legacy(query_embedding, account_id, categories, limit)
+    }
+
+    fn vec_search_legacy(
+        &self,
+        query_embedding: &[f32],
+        account_id: Option<&str>,
+        categories: Option<&[String]>,
+        limit: usize,
+    ) -> Result<Vec<(String, f32)>> {
         let blob = embedding_to_blob(query_embedding);
 
         // Step 1: KNN from vec0 (broad fetch). Read-only, use the pool.
@@ -860,7 +873,7 @@ mod tests {
         db.store_embedding_chunks("e-1", "acc1", std::slice::from_ref(&emb), "test-model", "hash")
             .unwrap();
         for (account, limit) in [(Some("acc1"), 1000), (None, 1000), (Some("acc1"), 10_000)] {
-            let hits = db.vec_search(&emb, account, None, limit).unwrap();
+            let hits = db.vec_search_legacy(&emb, account, None, limit).unwrap();
             assert_eq!(hits.len(), 1, "limit {limit}, account {account:?}");
         }
     }
@@ -880,7 +893,7 @@ mod tests {
                 .unwrap();
         }
 
-        let hits = db.vec_search(&emb, Some("acc1"), None, 10).unwrap();
+        let hits = db.vec_search_legacy(&emb, Some("acc1"), None, 10).unwrap();
         let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
         assert!(ids.contains(&"e-in"), "inbox email must be retrieved, got {:?}", ids);
         assert!(!ids.contains(&"e-spam"), "spam email must be excluded, got {:?}", ids);
@@ -929,7 +942,7 @@ mod tests {
         let db = Database::new_for_testing().unwrap();
         let emb = seed_deleted_and_junk(&db);
         for account in [Some("acc1"), None] {
-            let hits = db.vec_search(&emb, account, None, 10).unwrap();
+            let hits = db.vec_search_legacy(&emb, account, None, 10).unwrap();
             let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
             assert_eq!(ids, vec!["e-keep"], "account {account:?}");
         }
@@ -1148,6 +1161,6 @@ mod tests {
         assert!(!db.embedding_exists("e-keep", "new").unwrap(), "no orphan chunk row");
         assert!(db.embedding_exists("e-keep", "old").unwrap());
         assert_eq!(chunk_rows(&db, "e-keep"), 1);
-        assert_eq!(db.vec_search(&good, Some("acc1"), None, 10).unwrap().len(), 1);
+        assert_eq!(db.vec_search_legacy(&good, Some("acc1"), None, 10).unwrap().len(), 1);
     }
 }

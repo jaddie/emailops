@@ -224,7 +224,8 @@ impl Database {
             ],
         )?;
         tx.execute(
-            "INSERT OR REPLACE INTO email_bodies (email_id, body) VALUES (?1, ?2)",
+            "INSERT INTO email_bodies (email_id, body) VALUES (?1, ?2)
+             ON CONFLICT(email_id) DO UPDATE SET body=excluded.body",
             params![email.id, email.body],
         )?;
         let body_text = crate::util::html::strip_html_for_fts(&email.body);
