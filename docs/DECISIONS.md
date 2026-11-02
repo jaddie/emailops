@@ -4107,3 +4107,24 @@ already placed in `skills/` becomes usable through `/name` without a further ste
   run, and the request was about the feature.
 - *Removing the switch*: it is the way to drop the sidebar entry, and removing it would
   overrule anyone who turned skills off.
+
+## 2026-11-02 — Embedding configurations use verified, replaceable index generations
+
+**Decision:** Embedding dimensions are configured as native/detected or explicitly
+requested, and every returned vector must match the immutable, fingerprinted embedding
+configuration. Email, memory and help indexes are built alongside their active generation;
+configuration changes activate together through a transactional metadata switch only after
+validation and source-change reconciliation. Retain the previous generation for validated
+rollback, and persist progress, source revisions and worker fencing for interruption recovery.
+Preserve legacy 768-dimensional settings, metadata and vectors as unverified; use text search
+until a verified replacement is built, without automatically starting remote processing.
+**Context:** LM Studio can return a model's native 4096 dimensions despite a request for
+768. The old schemas and validation require 768, model names do not establish embedding-space
+identity, and delete-first rebuilding exposes the usable index to cancellation and failures.
+The approved design is recorded in `stage1-context.md`. This supersedes the fixed-768 probe
+and destructive re-index details of the September embedding decisions while preserving
+their explicit remote-processing consent, model validation and background-work controls.
+**Rejected:** Silently truncating or padding vectors; treating equal dimensions/model names
+as proof of compatibility; rewriting applied migrations; deleting the active index before a
+replacement is ready; certifying legacy vectors from current preferences without provenance;
+renaming sqlite-vec virtual tables, which the pinned extension does not support.
