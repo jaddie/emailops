@@ -35,6 +35,7 @@ vi.mock('@/stores/logStore', () => ({
 }));
 
 vi.mock('@/lib/api', () => ({
+  getEmbeddingLifecycle: vi.fn(() => Promise.resolve({ revision: 0, active: null, pending: null, retained: null })),
   getAiConfig: vi.fn(() =>
     Promise.resolve({
       provider: 'llamacpp',

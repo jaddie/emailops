@@ -148,3 +148,35 @@ message; Stage 4 must display it rather than present a generic rebuild failure.
 Retained profiles never restore old consent or credential references implicitly.
 Same-destination model/dimension rollback verifies the retained neutral baseline
 with current credentials, catches up sources and uses ordinary validation/activation.
+
+## Queued ownership and explicit opt-out
+
+Desktop commands hand a committed/resumed lease directly to
+`embedding_runtime::enqueue_build`. Its guard starts a ten-second heartbeat
+before enqueue, observes queued cancellation, and hands ownership to `run_build`
+when picked up. `TaskQueue::try_submit_named` exposes enqueue failure plus the
+existing shared task cancellation context. A dropped/failed/cancelled queued
+entry pauses only its exact generation/epoch/owner; it cannot stop a later resume.
+`run_build` failure cleanup uses the same ownership fence. No new lifecycle state
+or startup inference was added. Process death stops heartbeats; ordinary expired
+lease recovery marks interruption and still requires explicit re-probe/resume.
+Tests advance a `FixedClock` and paused Tokio time through eighty queued seconds
+without loading a provider, and cover cancellation followed by resume and enqueue
+failure. Heartbeats never revive an expired lease.
+
+`AiService::apply_embedding_opt_out` validates an explicitly empty model without
+an embedding request, stages credentials as usual, then atomically saves settings
+and pauses/fences pending work. It preserves active profile/vector bytes. Frozen
+sessions and typed retrieval both check the live empty-model opt-out. Re-enabling
+uses the explicit settings/build workflow; no paid work resumes automatically.
+
+Legacy `AiService::save_config`, `prepare_ai_settings` and `apply_ai_settings`
+share a model/backend/server-endpoint/dimension-policy guard whenever a managed
+active or pending generation exists. Same-contract chat-model/budget/thinking
+saves require no embedding probe; changed embedding contracts require the atomic
+workflow, and disabling requires the explicit opt-out path. Legacy preference
+writes use an optimistic revision fence and one SQLite transaction. Generic
+`set_pref` and downloaded-model auto-selection call `set_legacy_ai_preference`;
+unrelated preferences pass through normally, while current credential references,
+disclosure and canary metadata remain backend-owned. These guards do not wrap
+fixture/eval code that deliberately configures its own database directly.

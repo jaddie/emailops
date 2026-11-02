@@ -208,7 +208,7 @@
     "embeddingRecommendedEnglish": "empfohlen, nur Englisch",
     "embeddingNotice": "Ist ein Embeddings-Modell ausgewählt, wird der Text jeder indizierten E-Mail sowie jeder Suche und Chat-Frage an OpenRouter gesendet und zählt zum Monatsbudget. Ohne Modell ist die semantische Suche aus und es wird nur nach Stichwörtern gesucht.",
     "embeddingNeedsKey": "Speichere deinen API-Schlüssel, um die Liste der Embeddings-Modelle zu laden.",
-    "embeddingNeedsCheck": "Beim Speichern wird geprüft, ob dieses Modell die 768-dimensionalen Vektoren liefert, die der E-Mail-Index braucht.",
+    "embeddingNeedsCheck": "Beim Speichern werden das Modell und die gewählte Dimensionseinstellung vor dem Aufbau eines Ersatzindex geprüft.",
     "embeddingCheckFailed": "Es wurde nichts gespeichert – das Embeddings-Modell kann nicht verwendet werden: {{error}}",
     "embeddingZdrBlocked": "Es wurde nichts gespeichert – kein Anbieter des Embeddings-Modells {{model}} erfüllt die Einstellung ohne Datenspeicherung. Schalte „Nur ohne Datenspeicherung“ unter Einstellungen → KI → OpenRouter aus oder verwende kein Embeddings-Modell (nur Stichwortsuche).",
     "embeddingListFailed": "Die Embeddings-Modelle von OpenRouter konnten nicht geladen werden: {{error}}"
@@ -250,14 +250,6 @@
     "disclosureRetention": "EmailOps kann nicht steuern, ob dieser Server oder ein Dienst dahinter diese Inhalte aufbewahrt oder Modelle damit trainiert. Fahre nur fort, wenn du dem Server vertraust.",
     "disclosureLocalHint": "Damit deine Post in einem Netzwerk bleibt, das du kontrollierst, erreiche den Server über einen SSH-Tunnel oder Tailscale und nutze http://localhost.",
     "disclosureConfirm": "An diesen Server senden"
-  },
-  "confirmReindex": {
-    "title": "Alle Embeddings neu erzeugen?",
-    "body": "Das Embeddings-Modell wurde geändert. Beim Speichern werden alle vorhandenen Embeddings gelöscht und mit dem neuen Modell neu erzeugt. Die semantische Suche ist eingeschränkt, bis das abgeschlossen ist.",
-    "bodyNone": "Es ist kein Embeddings-Modell ausgewählt. Beim Speichern werden alle vorhandenen Embeddings gelöscht und die semantische Suche wird ausgeschaltet: Es wird nur nach Stichwörtern gesucht, bis du ein Modell auswählst.",
-    "openRouter": "Der Text jeder indizierten E-Mail wird an OpenRouter gesendet und über dein OpenRouter-Konto abgerechnet.",
-    "confirm": "Speichern und neu erzeugen",
-    "confirmNone": "Speichern und löschen"
   },
   "aiWork": {
     "title": "KI-Arbeit läuft",
@@ -746,5 +738,47 @@
     "website": "Website",
     "sourceCode": "Quellcode auf GitHub",
     "sponsor": "Projekt unterstützen ♥"
+  },
+  "embeddingLifecycle": {
+    "title": "Embedding-Index",
+    "warning": "Änderungen erstellen einen Ersatz neben dem aktiven Index und können Daten an den gewählten Anbieter senden. Alte Indizes sind nicht verifiziert; bis zum verifizierten Aufbau wird Textsuche verwendet.",
+    "identity": "Die Modellrevision ist möglicherweise nicht verfügbar; die beobachtete Identität garantiert nicht, dass der Server sein Modell nicht geändert hat.",
+    "active": "Aktiv",
+    "pending": "Ausstehend",
+    "retained": "Aufbewahrt",
+    "legacy": "Nicht verifizierter alter Index",
+    "noRevision": "Serverrevision nicht verfügbar",
+    "failed": "Fehler",
+    "disabled": "(deaktiviert)",
+    "dimensions": "Dimensionen",
+    "native": "Nativ (erkennen)",
+    "explicit": "Explizit",
+    "preview": "Vorschau und Aufbau",
+    "stop": "Stoppen",
+    "resume": "Fortsetzen / erneut versuchen",
+    "discard": "Verwerfen",
+    "rollback": "Zurücksetzen",
+    "Emails": "E-Mails",
+    "MemoryFacts": "Speicher",
+    "HelpDocs": "Hilfedokumente",
+    "confirm": "{{model}} mit {{dimensions}} erkannten Dimensionen erstellen und aktivieren? Ein verifizierter aktiver Index bleibt während des Aufbaus verfügbar.",
+    "requested": "Angefordert",
+    "detected": "Erkannt",
+    "activate": "Erstellen und aktivieren",
+    "state": {
+      "active": "Aktiv",
+      "retained": "Aufbewahrt",
+      "legacy_unverified": "Alt, nicht verifiziert",
+      "preparing": "Vorbereitung",
+      "building": "Aufbau",
+      "validating": "Validierung",
+      "paused": "Pausiert",
+      "failed": "Fehlgeschlagen",
+      "interrupted": "Unterbrochen",
+      "repair": "Reparatur erforderlich"
+    },
+    "disableTitle": "Embeddings deaktivieren",
+    "disableWarning": "Die semantische Suche verwendet Textsuche. Vorhandene Indizes bleiben erhalten und ein ausstehender Aufbau wird gestoppt.",
+    "disable": "Embeddings deaktivieren"
   }
 }

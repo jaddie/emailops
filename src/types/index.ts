@@ -1596,3 +1596,13 @@ export interface DocVersion {
   origin: 'local' | 'remote';
   createdAt: number;
 }
+
+// Embedding lifecycle contracts are generated from the Rust command DTOs.
+export type { AiSettingsInput as EmbeddingSettingsInput } from './generated/AiSettingsInput';
+export type { Corpus as EmbeddingCorpus } from './generated/Corpus';
+export type { DimensionPolicy as EmbeddingDimensionPolicy } from './generated/DimensionPolicy';
+export type { EmbeddingBuildPreview } from './generated/EmbeddingBuildPreview';
+export type { EmbeddingGenerationSnapshot as EmbeddingGeneration } from './generated/EmbeddingGenerationSnapshot';
+export type { EmbeddingLifecycle } from './generated/EmbeddingLifecycle';
+export type { EmbeddingProfile } from './generated/EmbeddingProfile';
+export type { ServerSettingsInput } from './generated/ServerSettingsInput';

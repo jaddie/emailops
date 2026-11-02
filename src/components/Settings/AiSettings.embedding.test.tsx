@@ -36,6 +36,11 @@ vi.mock('./AiSettings/ChatPromptsSection', () => ({ ChatPromptsSection: () => nu
 vi.mock('./AiSettings/openRouterEmbeddingModels', () => ({ RECOMMENDED_OPENROUTER_EMBEDDING_MODELS: [] }));
 
 const api = vi.hoisted(() => ({
+  getEmbeddingLifecycle: vi.fn(() => Promise.resolve({ revision: 0, active: null, pending: null, retained: null })),
+  previewEmbeddingSettings: vi.fn(() => Promise.resolve({ profile: { model: 'test', dimensions: 768 } })),
+  commitEmbeddingSettings: vi.fn(() => Promise.resolve()),
+  controlEmbeddingBuild: vi.fn(() => Promise.resolve()),
+  disableEmbeddingSettings: vi.fn(() => Promise.resolve()),
   getAiConfig: vi.fn(),
   detectAiCapability: vi.fn(() => Promise.resolve({ embeddedAiAvailable: true })),
   listCatalogModels: vi.fn(() =>
@@ -204,14 +209,55 @@ describe('AiSettings — embedding model', () => {
     await settle();
   }
 
-  const reindexDialogShown = () => container.textContent?.includes('settings:confirmReindex.title') ?? false;
+  const reindexDialogShown = () =>
+    container.querySelector('[role=dialog][aria-labelledby=embedding-confirm-title]') !== null;
 
   async function confirmReindex() {
     await act(async () => {
-      button('settings:confirmReindex.confirm').click();
+      (
+        container.querySelector('[aria-labelledby=embedding-confirm-title] button.bg-primary-600') as HTMLButtonElement
+      ).click();
     });
     await settle();
   }
+
+  it('preserves legacy 768 and uses atomic preview and commit for a changed model', async () => {
+    await mount({});
+    await choose('vendor/embed-large');
+    await save();
+    expect(api.previewEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ embeddingModel: 'vendor/embed-large' }),
+      { Explicit: 768 },
+    );
+    expect(api.setAiConfig).not.toHaveBeenCalled();
+    expect(api.commitEmbeddingSettings).not.toHaveBeenCalled();
+    await act(async () => {
+      (
+        container.querySelector('[aria-labelledby=embedding-confirm-title] button.bg-primary-600') as HTMLButtonElement
+      ).click();
+    });
+    await settle();
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledOnce();
+    expect(api.regenerateEmbeddings).not.toHaveBeenCalled();
+  });
+
+  it('leaves settings unchanged when the preview is stale', async () => {
+    api.previewEmbeddingSettings.mockRejectedValueOnce(new Error('settings changed; preview again'));
+    await mount({});
+    await choose('vendor/embed-large');
+    await save();
+    expect(container.textContent).toContain('settings changed; preview again');
+    expect(api.commitEmbeddingSettings).not.toHaveBeenCalled();
+    expect(api.setAiConfig).not.toHaveBeenCalled();
+  });
+
+  it('saves unrelated chat settings without probing embeddings', async () => {
+    await mount({});
+    await typeChatModel('vendor/new-chat');
+    await save();
+    expect(api.setAiConfig).toHaveBeenCalledOnce();
+    expect(api.previewEmbeddingSettings).not.toHaveBeenCalled();
+  });
 
   it('lists the OpenRouter embedding models in the selector', async () => {
     await mount({});
@@ -223,69 +269,36 @@ describe('AiSettings — embedding model', () => {
     ]);
   });
 
-  it('checks a newly chosen OpenRouter embedding model before saving it, then re-indexes', async () => {
+  it('previews before atomically committing a changed embedding model', async () => {
     await mount({});
     await choose('vendor/embed-large');
     await save();
-    await confirmReindex();
-
-    expect(api.validateOpenRouterEmbeddingModel).toHaveBeenCalledWith('vendor/embed-large', null, false);
-    expect(api.setAiConfig).toHaveBeenCalledWith(
-      'openrouter',
-      'vendor/model',
-      'vendor/embed-large',
-      null,
-      0,
-      false,
-      false,
-      undefined,
+    expect(api.previewEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ embeddingModel: 'vendor/embed-large' }),
+      { Explicit: 768 },
     );
-    expect(api.validateOpenRouterEmbeddingModel.mock.invocationCallOrder[0]).toBeLessThan(
-      api.setAiConfig.mock.invocationCallOrder[0],
-    );
-    expect(api.regenerateEmbeddings).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not save when the model fails the check, and shows why', async () => {
-    api.validateOpenRouterEmbeddingModel.mockRejectedValueOnce('returns 1536-dimension vectors');
-    await mount({});
-    await choose('vendor/embed-large');
-    await save();
+    expect(api.commitEmbeddingSettings).not.toHaveBeenCalled();
     await confirmReindex();
-
-    expect(api.setAiConfig).not.toHaveBeenCalled();
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledOnce();
     expect(api.regenerateEmbeddings).not.toHaveBeenCalled();
-    expect(container.textContent).toContain('settings:openRouter.embeddingCheckFailed: returns 1536-dimension vectors');
   });
 
-  const dataPolicyRejection = {
-    code: 'ai_data_policy',
-    params: { model: 'vendor/embed-large' },
-    message: 'The model vendor/embed-large is not available under the data policy',
-  };
+  it('does not save when the model probe fails, and shows why', async () => {
+    api.previewEmbeddingSettings.mockRejectedValueOnce('returns 1536-dimension vectors');
+    await mount({});
+    await choose('vendor/embed-large');
+    await save();
+    expect(api.commitEmbeddingSettings).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('returns 1536-dimension vectors');
+  });
 
-  it('says zero data retention is what blocks the model, and what the options are', async () => {
-    api.validateOpenRouterEmbeddingModel.mockRejectedValueOnce(dataPolicyRejection);
+  it('explains a zero data retention refusal', async () => {
+    api.previewEmbeddingSettings.mockRejectedValueOnce({ code: 'ai_data_policy', params: {}, message: 'blocked' });
     await mount({ zeroDataRetention: true });
     await choose('vendor/embed-large');
     await save();
-    await confirmReindex();
-
-    expect(api.validateOpenRouterEmbeddingModel).toHaveBeenCalledWith('vendor/embed-large', null, true);
-    expect(api.setAiConfig).not.toHaveBeenCalled();
     expect(container.textContent).toContain('settings:openRouter.embeddingZdrBlocked');
-    expect(container.textContent).not.toContain('settings:openRouter.embeddingCheckFailed');
-  });
-
-  it('keeps the general message for a data-policy refusal without zero data retention', async () => {
-    api.validateOpenRouterEmbeddingModel.mockRejectedValueOnce(dataPolicyRejection);
-    await mount({});
-    await choose('vendor/embed-large');
-    await save();
-    await confirmReindex();
-
-    expect(container.textContent).toContain('settings:openRouter.embeddingCheckFailed');
-    expect(container.textContent).not.toContain('settings:openRouter.embeddingZdrBlocked');
+    expect(api.commitEmbeddingSettings).not.toHaveBeenCalled();
   });
 
   it('does not check again a model that is saved and already validated', async () => {
@@ -300,21 +313,25 @@ describe('AiSettings — embedding model', () => {
   it('checks on save a model that was saved without ever being validated', async () => {
     await mount({ openRouterValidatedEmbeddingModel: null });
     await save();
-    expect(api.validateOpenRouterEmbeddingModel).toHaveBeenCalledWith('vendor/embed', null, false);
+    expect(api.previewEmbeddingSettings).not.toHaveBeenCalled();
   });
 
-  it('switching to OpenRouter drops the local embedding model instead of sending its id', async () => {
+  it('switching to OpenRouter does not send the local model and confirms opt-out', async () => {
     await mount({ provider: 'llamacpp', model: 'chat-local-gguf', embeddingModel: 'embed-local-gguf' });
     await switchTo('settings:ai.providerOpenRouterLabel');
-
     expect(embeddingSelect().value).toBe('');
     await typeChatModel('vendor/model');
     await save();
-    await confirmReindex();
-
-    expect(api.validateOpenRouterEmbeddingModel).not.toHaveBeenCalled();
-    expect(api.setAiConfig.mock.calls[0].slice(0, 3)).toEqual(['openrouter', 'vendor/model', '']);
-    expect(api.regenerateEmbeddings).toHaveBeenCalledTimes(1);
+    expect(api.disableEmbeddingSettings).not.toHaveBeenCalled();
+    await act(async () => {
+      button('settings:embeddingLifecycle.disable').click();
+    });
+    await settle();
+    expect(api.disableEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'openrouter', embeddingModel: '' }),
+      0,
+    );
+    expect(api.previewEmbeddingSettings).not.toHaveBeenCalled();
   });
 
   it('switching away from OpenRouter picks a model the new provider can run', async () => {
@@ -323,8 +340,12 @@ describe('AiSettings — embedding model', () => {
     await save();
     await confirmReindex();
 
-    expect(api.setAiConfig.mock.calls[0].slice(0, 3)).toEqual(['llamacpp', 'chat-local-gguf', 'embed-local-gguf']);
-    expect(api.regenerateEmbeddings).toHaveBeenCalledTimes(1);
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'llamacpp', model: 'chat-local-gguf', embeddingModel: 'embed-local-gguf' }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(api.regenerateEmbeddings).not.toHaveBeenCalled();
   });
 
   it('switching to OpenRouter offers its default chat model instead of the in-app one', async () => {
@@ -349,7 +370,11 @@ describe('AiSettings — embedding model', () => {
     await save();
     await confirmReindex();
 
-    expect(api.setAiConfig.mock.calls[0].slice(0, 2)).toEqual(['ollama', 'ollama-chat']);
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'ollama', model: 'ollama-chat' }),
+      expect.anything(),
+      expect.anything(),
+    );
   });
 
   it('does not save OpenRouter without a chat model, and says so', async () => {
@@ -374,9 +399,8 @@ describe('AiSettings — embedding model', () => {
     await save();
 
     expect(reindexDialogShown()).toBe(true);
-    expect(container.textContent).toContain('settings:confirmReindex.body');
-    expect(container.textContent).toContain('settings:confirmReindex.openRouter');
-    expect(api.validateOpenRouterEmbeddingModel).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('settings:embeddingLifecycle.warning');
+    expect(api.previewEmbeddingSettings).toHaveBeenCalledOnce();
     expect(api.setAiConfig).not.toHaveBeenCalled();
     expect(api.regenerateEmbeddings).not.toHaveBeenCalled();
   });
@@ -397,19 +421,19 @@ describe('AiSettings — embedding model', () => {
     expect(api.regenerateEmbeddings).not.toHaveBeenCalled();
   });
 
-  it('says semantic search will be off when the new choice is no model', async () => {
+  it('confirms text-search fallback and preserves existing vectors when disabling embeddings', async () => {
     await mount({});
     await choose('');
     await save();
-
-    expect(container.textContent).toContain('settings:confirmReindex.bodyNone');
-    expect(container.textContent).not.toContain('settings:confirmReindex.openRouter');
+    expect(container.textContent).toContain('settings:embeddingLifecycle.disableWarning');
+    expect(api.disableEmbeddingSettings).not.toHaveBeenCalled();
     await act(async () => {
-      button('settings:confirmReindex.confirmNone').click();
+      button('settings:embeddingLifecycle.disable').click();
     });
     await settle();
-    expect(api.setAiConfig.mock.calls[0].slice(0, 3)).toEqual(['openrouter', 'vendor/model', '']);
-    expect(api.regenerateEmbeddings).toHaveBeenCalledTimes(1);
+    expect(api.disableEmbeddingSettings).toHaveBeenCalledWith(expect.objectContaining({ embeddingModel: '' }), 0);
+    expect(api.previewEmbeddingSettings).not.toHaveBeenCalled();
+    expect(api.regenerateEmbeddings).not.toHaveBeenCalled();
   });
 
   it('does not mention OpenRouter when the new model runs locally', async () => {
@@ -417,8 +441,7 @@ describe('AiSettings — embedding model', () => {
     await switchTo('settings:ai.providerEmbeddedLabel');
     await save();
 
-    expect(container.textContent).toContain('settings:confirmReindex.body');
-    expect(container.textContent).not.toContain('settings:confirmReindex.openRouter');
+    expect(container.textContent).toContain('settings:embeddingLifecycle.warning');
   });
 
   it('does not ask when there were no Embeddings to replace', async () => {
@@ -426,9 +449,12 @@ describe('AiSettings — embedding model', () => {
     await choose('vendor/embed');
     await save();
 
-    expect(reindexDialogShown()).toBe(false);
-    expect(api.validateOpenRouterEmbeddingModel).toHaveBeenCalledWith('vendor/embed', null, false);
-    expect(api.setAiConfig).toHaveBeenCalled();
+    expect(reindexDialogShown()).toBe(true);
+    expect(api.previewEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ embeddingModel: 'vendor/embed' }),
+      expect.anything(),
+    );
+    expect(api.commitEmbeddingSettings).not.toHaveBeenCalled();
   });
 
   // The developer's sequence: OpenRouter with an embedding model, then the
@@ -449,7 +475,11 @@ describe('AiSettings — embedding model', () => {
     );
     await save();
     await confirmReindex();
-    expect(api.setAiConfig.mock.calls[0].slice(0, 3)).toEqual(['llamacpp', 'chat-local-gguf', 'embed-local-gguf']);
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'llamacpp', model: 'chat-local-gguf', embeddingModel: 'embed-local-gguf' }),
+      expect.anything(),
+      expect.anything(),
+    );
 
     await switchTo('settings:ai.providerOpenRouterLabel');
 
@@ -462,8 +492,12 @@ describe('AiSettings — embedding model', () => {
     await confirmReindex();
 
     expect(api.validateOpenRouterEmbeddingModel).not.toHaveBeenCalled();
-    expect(api.setAiConfig.mock.calls[1].slice(0, 3)).toEqual(['openrouter', 'vendor/model', 'vendor/embed']);
-    expect(api.regenerateEmbeddings).toHaveBeenCalledTimes(2);
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'openrouter', model: 'vendor/model', embeddingModel: 'vendor/embed' }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(api.regenerateEmbeddings).not.toHaveBeenCalled();
   });
 
   it('does not ask to re-index when returning to the saved provider restores the saved model', async () => {
@@ -491,7 +525,10 @@ describe('AiSettings — embedding model', () => {
     await save();
     await confirmReindex();
 
-    expect(api.validateOpenRouterEmbeddingModel).toHaveBeenCalledWith('vendor/embed-large', null, false);
+    expect(api.previewEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ embeddingModel: 'vendor/embed-large' }),
+      expect.anything(),
+    );
   });
 
   // The state a provider switch outside Settings could leave: the in-app
@@ -510,8 +547,12 @@ describe('AiSettings — embedding model', () => {
 
     expect(reindexDialogShown()).toBe(true);
     await confirmReindex();
-    expect(api.setAiConfig.mock.calls[0].slice(0, 3)).toEqual(['llamacpp', 'chat-local-gguf', 'embed-local-gguf']);
-    expect(api.regenerateEmbeddings).toHaveBeenCalledTimes(1);
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'llamacpp', model: 'chat-local-gguf', embeddingModel: 'embed-local-gguf' }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(api.regenerateEmbeddings).not.toHaveBeenCalled();
   });
   // ── Work in progress ───────────────────────────────────────────────────
 
@@ -543,8 +584,8 @@ describe('AiSettings — embedding model', () => {
     expect(api.setAiConfig).not.toHaveBeenCalled();
 
     await confirmReindex();
-    expect(api.setAiConfig).toHaveBeenCalledTimes(1);
-    expect(api.regenerateEmbeddings).toHaveBeenCalledTimes(1);
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledTimes(1);
+    expect(api.regenerateEmbeddings).not.toHaveBeenCalled();
   });
 
   it('saves nothing and keeps the form when the work-in-progress dialog is cancelled', async () => {

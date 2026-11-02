@@ -124,7 +124,13 @@ const IN_APP_EMBEDDINGS_UNAVAILABLE: &str = "This build of EmailOps does not inc
      Choose the server or OpenRouter for the email index in Settings → AI.";
 
 /// What Settings sends when the AI config is saved.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
+#[serde(rename_all = "camelCase")]
 pub struct AiSettingsInput {
     pub provider: String,
     pub model: String,
@@ -648,38 +654,7 @@ impl AiService {
             )?);
             super::embedding_session::remember_canary(db, &profile, &result.embedding)?;
         }
-        let mut writes = vec![
-            ("ai_provider".into(), Some(input.provider.clone())),
-            ("ai_model".into(), Some(input.model.clone())),
-            ("ai_embedding_model".into(), Some(profile.model.clone())),
-            (remembered_model_pref(&input.provider), Some(input.model.clone())),
-            (remembered_embedding_pref(&input.provider), Some(profile.model.clone())),
-            ("ai_monthly_budget".into(), Some(input.monthly_budget_usd.to_string())),
-            (
-                "ai_period_start".into(),
-                Some(chrono::Utc::now().timestamp().to_string()),
-            ),
-        ];
-        if let Some(thinking) = input.thinking_enabled {
-            writes.push(("ai_thinking_enabled".into(), Some(thinking.to_string())));
-        }
-        if let Some(zdr) = input.zero_data_retention {
-            writes.push((OPENROUTER_ZDR_PREF.into(), Some(zdr.to_string())));
-        }
-        if let Some(previous) = db
-            .get_preference("ai_provider")?
-            .filter(|previous| previous != &input.provider)
-        {
-            if let Some(model) = db.get_preference("ai_model")? {
-                writes.push((remembered_model_pref(&previous), Some(model)));
-            }
-            if let Some(model) = current_embedding {
-                writes.push((remembered_embedding_pref(&previous), Some(model)));
-            }
-        }
-        if let Some(plan) = &prepared.server {
-            writes.extend(ai_server::server_preference_writes(plan));
-        }
+        let mut writes = Self::planned_ai_preference_writes(db, &input, &profile.model, prepared.server.as_ref())?;
         let mode = match policy {
             DimensionPolicy::Native => EmbeddingDimensions::Native,
             DimensionPolicy::Explicit(n) if n == crate::db::embeddings::EMAIL_EMBEDDING_DIM => {
@@ -721,6 +696,80 @@ impl AiService {
         })
     }
 
+    fn planned_ai_preference_writes(
+        db: &Database,
+        input: &AiSettingsInput,
+        embedding_model: &str,
+        server: Option<&ServerSettingsPlan>,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut writes = vec![
+            ("ai_provider".into(), Some(input.provider.clone())),
+            ("ai_model".into(), Some(input.model.clone())),
+            ("ai_embedding_model".into(), Some(embedding_model.to_string())),
+            (remembered_model_pref(&input.provider), Some(input.model.clone())),
+            (
+                remembered_embedding_pref(&input.provider),
+                Some(embedding_model.to_string()),
+            ),
+            ("ai_monthly_budget".into(), Some(input.monthly_budget_usd.to_string())),
+            (
+                "ai_period_start".into(),
+                Some(chrono::Utc::now().timestamp().to_string()),
+            ),
+        ];
+        if let Some(thinking) = input.thinking_enabled {
+            writes.push(("ai_thinking_enabled".into(), Some(thinking.to_string())));
+        }
+        if let Some(zdr) = input.zero_data_retention {
+            writes.push((OPENROUTER_ZDR_PREF.into(), Some(zdr.to_string())));
+        }
+        if let Some(previous) = db
+            .get_preference("ai_provider")?
+            .filter(|previous| previous != &input.provider)
+        {
+            if let Some(model) = db.get_preference("ai_model")? {
+                writes.push((remembered_model_pref(&previous), Some(model)));
+            }
+            if let Some(model) = db.get_preference("ai_embedding_model")? {
+                writes.push((remembered_embedding_pref(&previous), Some(model)));
+            }
+        }
+        if let Some(plan) = server {
+            writes.extend(ai_server::server_preference_writes(plan));
+        }
+        Ok(writes)
+    }
+
+    pub async fn apply_embedding_opt_out(db: &Database, input: AiSettingsInput, expected_revision: i64) -> Result<()> {
+        if input.embedding_model.as_deref().map(str::trim) != Some("") {
+            return Err(AppError::InvalidInput(
+                "Choose an explicitly empty embedding model to disable Embeddings".into(),
+            ));
+        }
+        if db.embedding_generation_control()?.revision != expected_revision {
+            return Err(AppError::InvalidInput(
+                "AI settings changed; refresh before disabling Embeddings".into(),
+            ));
+        }
+        let prepared = Self::prepare_ai_settings_inner(db, input, None, false).await?;
+        let mut writes = Self::planned_ai_preference_writes(db, &prepared.input, "", prepared.server.as_ref())?;
+        if let Some(server) = &prepared.server {
+            writes.extend(ai_server::stage_key_change(db, &server.key, Self::use_dev_ai_keys())?);
+        }
+        if let Some(key) = prepared
+            .input
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            if prepared.input.provider == "openrouter" {
+                writes.extend(Self::stage_openrouter_api_key(key)?);
+            }
+        }
+        db.apply_embedding_opt_out_preferences(expected_revision, &writes)
+    }
+
     pub async fn embedding_session(
         db: Arc<Database>,
         profile: &crate::db::embedding_generations::EmbeddingProfile,
@@ -740,6 +789,14 @@ impl AiService {
         use crate::db::embedding_generations::Corpus;
         if !db.is_ai_enabled()? {
             return Err(AppError::AiDisabled);
+        }
+        if db
+            .get_preference("ai_embedding_model")?
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(AppError::InvalidInput(
+                "Embeddings are disabled; choose an embedding model and build its index before continuing".into(),
+            ));
         }
         if match corpus {
             Corpus::Emails => false,
@@ -1329,6 +1386,163 @@ impl AiService {
         })
     }
 
+    /// Every legacy settings entry point uses this before probing or writing.
+    /// Managed identity transitions are published only by the atomic workflow.
+    fn guard_legacy_embedding_change(
+        db: &Database,
+        provider: &str,
+        embedding_model: Option<&str>,
+        server: Option<&ServerSettingsPlan>,
+        policy: Option<&crate::db::embedding_generations::DimensionPolicy>,
+    ) -> Result<bool> {
+        let control = db.embedding_generation_control()?;
+        if control.active_id.is_none() && control.pending_id.is_none() {
+            return Ok(false);
+        }
+        let current = Self::get_config(db)?;
+        let stored_server = ai_server::load_server_settings(db)?;
+        let current_backend = embedding_backend(&current.provider, stored_server.embedding_source);
+        let source = server
+            .map(|plan| plan.embedding_source)
+            .unwrap_or(stored_server.embedding_source);
+        let proposed_backend = embedding_backend(provider, source);
+        let proposed_model = if embedding_model.is_none() && current.embedding_model.trim().is_empty() {
+            String::new()
+        } else {
+            plan_embedding_model(
+                proposed_backend,
+                embedding_model,
+                Some(&current.embedding_model),
+                Self::stored_embedding_model(db, provider)?.as_deref(),
+                Self::stored_embedding_model(db, "openrouter")?.as_deref(),
+            )
+            .model
+        };
+        let current_endpoint = if current_backend == ai_server::PROVIDER_ID {
+            stored_server
+                .base_url
+                .clone()
+                .map(|url| normalize_ai_base_url(&url))
+                .transpose()?
+        } else {
+            None
+        };
+        let proposed_endpoint = if proposed_backend == ai_server::PROVIDER_ID {
+            server
+                .map(|plan| plan.base_url.clone())
+                .or(stored_server.base_url.clone())
+                .map(|url| normalize_ai_base_url(&url))
+                .transpose()?
+        } else {
+            None
+        };
+        let mut changed = current_backend != proposed_backend
+            || current.embedding_model != proposed_model
+            || current_endpoint != proposed_endpoint;
+        if let Some(policy) = policy {
+            let mut known = None;
+            for id in control.pending_id.into_iter().chain(control.active_id) {
+                let profile = db.embedding_generation_profile(id)?;
+                if profile.backend == current_backend
+                    && profile.model == current.embedding_model
+                    && (current_backend != ai_server::PROVIDER_ID || profile.endpoint == current_endpoint)
+                {
+                    known = Some(profile.dimension_policy);
+                    break;
+                }
+            }
+            if known.is_none() {
+                let mode = match current_backend {
+                    ai_server::PROVIDER_ID => match current_endpoint.as_deref() {
+                        Some(endpoint) => Self::server_embedding_dimensions(db, endpoint, &current.embedding_model)?,
+                        None => None,
+                    },
+                    "openrouter" => Self::openrouter_embedding_dimensions(db, &current.embedding_model)?,
+                    _ => None,
+                };
+                known = Some(match mode {
+                    Some(EmbeddingDimensions::Native) => crate::db::embedding_generations::DimensionPolicy::Native,
+                    Some(EmbeddingDimensions::Explicit(n)) => {
+                        crate::db::embedding_generations::DimensionPolicy::Explicit(n)
+                    }
+                    _ => crate::db::embedding_generations::DimensionPolicy::Explicit(
+                        crate::db::embeddings::EMAIL_EMBEDDING_DIM,
+                    ),
+                });
+            }
+            if known.as_ref().is_some_and(|known| known != policy) {
+                changed = true;
+            }
+        }
+        if changed {
+            return Err(AppError::InvalidInput("This change affects the managed embedding index. Use AI Settings to preview and atomically build the replacement, or explicitly disable Embeddings; the legacy settings save cannot change its model, dimensions or destination".into()));
+        }
+        Ok(true)
+    }
+
+    /// Shared guard for raw preference IPC and model-download auto-selection.
+    pub fn set_legacy_ai_preference(db: &Database, key: &str, value: &str) -> Result<()> {
+        if matches!(
+            key,
+            "openai_compatible_api_key_id"
+                | "openai_compatible_api_key_dev"
+                | "openrouter_api_key_id"
+                | "openrouter_api_key_dev"
+                | "openai_compatible_disclosed_host"
+        ) || key.starts_with("openrouter_api_key_dev:")
+            || key.starts_with("embedding_canary:")
+        {
+            return Err(AppError::InvalidInput("Credential references, provider disclosure and embedding verification are backend-owned; use AI Settings".into()));
+        }
+        if !matches!(
+            key,
+            "ai_provider"
+                | "ai_embedding_model"
+                | "openai_compatible_base_url"
+                | "openai_compatible_embedding_source"
+                | "openai_compatible_embedding_dimensions"
+                | "openai_compatible_embedding_actual_dimensions"
+                | "openrouter_embedding_dimensions"
+                | "openrouter_embedding_actual_dimensions"
+                | "openai_compatible_embedding_validated"
+                | "openrouter_embedding_validated_model"
+        ) {
+            return db.set_preference(key, value);
+        }
+        let revision = db.embedding_generation_control()?.revision;
+        let managed = {
+            let control = db.embedding_generation_control()?;
+            control.active_id.is_some() || control.pending_id.is_some()
+        };
+        match key {
+            "ai_provider" => {
+                Self::guard_legacy_embedding_change(db, value, None, None, None)?;
+            }
+            "ai_embedding_model" => {
+                let provider = Self::get_config(db)?.provider;
+                Self::guard_legacy_embedding_change(db, &provider, Some(value), None, None)?;
+            }
+            key if managed
+                && matches!(
+                    key,
+                    "openai_compatible_base_url"
+                        | "openai_compatible_embedding_source"
+                        | "openai_compatible_embedding_dimensions"
+                        | "openai_compatible_embedding_actual_dimensions"
+                        | "openrouter_embedding_dimensions"
+                        | "openrouter_embedding_actual_dimensions"
+                        | "openai_compatible_embedding_validated"
+                        | "openrouter_embedding_validated_model"
+                )
+                && db.get_preference(key)?.as_deref() != Some(value) =>
+            {
+                return Err(AppError::InvalidInput("Managed embedding configuration must be changed through AI Settings preview/build or explicit disable".into()));
+            }
+            _ => {}
+        }
+        db.apply_fenced_ai_preference_writes(revision, &[(key.into(), Some(value.into()))])
+    }
+
     pub fn save_config(
         db: &Database,
         provider: &str,
@@ -1338,30 +1552,48 @@ impl AiService {
         thinking_enabled: Option<bool>,
         zero_data_retention: Option<bool>,
     ) -> Result<()> {
+        let revision = db.embedding_generation_control()?.revision;
+        Self::guard_legacy_embedding_change(db, provider, embedding_model, None, None)?;
         let current_embedding = db.get_preference("ai_embedding_model")?;
+        let mut writes = Vec::new();
+        let mut save = |key: &str, value: &str| -> Result<()> {
+            writes.push((key.to_string(), Some(value.to_string())));
+            Ok(())
+        };
         let source = ai_server::load_server_settings(db)?.embedding_source;
         // Leaving a provider: remember the models it was using, which may
         // have changed outside this function (quick model selector, download
         // auto-select) since they were last saved.
         if let Some(previous) = db.get_preference("ai_provider")?.filter(|p| p != provider) {
             if let Some(previous_model) = db.get_preference("ai_model")? {
-                db.set_preference(&remembered_model_pref(&previous), &previous_model)?;
+                save(&remembered_model_pref(&previous), &previous_model)?;
             }
             let openrouter_model = Self::stored_embedding_model(db, "openrouter")?;
             if let Some(previous_embedding) = current_embedding.as_ref().filter(|m| {
                 embedding_model_usable(embedding_backend(&previous, source), m, openrouter_model.as_deref())
             }) {
-                db.set_preference(&remembered_embedding_pref(&previous), previous_embedding)?;
+                save(&remembered_embedding_pref(&previous), previous_embedding)?;
             }
         }
 
-        let plan = plan_embedding_model(
-            embedding_backend(provider, source),
-            embedding_model,
-            current_embedding.as_deref(),
-            Self::stored_embedding_model(db, provider)?.as_deref(),
-            Self::stored_embedding_model(db, "openrouter")?.as_deref(),
-        );
+        let plan = if embedding_model.is_none()
+            && current_embedding
+                .as_deref()
+                .is_some_and(|model| model.trim().is_empty())
+        {
+            EmbeddingModelPlan {
+                model: String::new(),
+                corrected_from: None,
+            }
+        } else {
+            plan_embedding_model(
+                embedding_backend(provider, source),
+                embedding_model,
+                current_embedding.as_deref(),
+                Self::stored_embedding_model(db, provider)?.as_deref(),
+                Self::stored_embedding_model(db, "openrouter")?.as_deref(),
+            )
+        };
         if let Some(unusable) = &plan.corrected_from {
             crate::services::logger::log(
                 "warn",
@@ -1373,23 +1605,23 @@ impl AiService {
             );
         }
 
-        db.set_preference("ai_provider", provider)?;
-        db.set_preference("ai_model", model)?;
-        db.set_preference("ai_embedding_model", &plan.model)?;
-        db.set_preference(&remembered_model_pref(provider), model)?;
-        db.set_preference(&remembered_embedding_pref(provider), &plan.model)?;
-        db.set_preference("ai_monthly_budget", &monthly_budget_usd.to_string())?;
+        save("ai_provider", provider)?;
+        save("ai_model", model)?;
+        save("ai_embedding_model", &plan.model)?;
+        save(&remembered_model_pref(provider), model)?;
+        save(&remembered_embedding_pref(provider), &plan.model)?;
+        save("ai_monthly_budget", &monthly_budget_usd.to_string())?;
         if let Some(thinking) = thinking_enabled {
-            db.set_preference("ai_thinking_enabled", if thinking { "true" } else { "false" })?;
+            save("ai_thinking_enabled", if thinking { "true" } else { "false" })?;
         }
         if let Some(zdr) = zero_data_retention {
-            db.set_preference(OPENROUTER_ZDR_PREF, if zdr { "true" } else { "false" })?;
+            save(OPENROUTER_ZDR_PREF, if zdr { "true" } else { "false" })?;
         }
 
         let now = chrono::Utc::now().timestamp();
-        db.set_preference("ai_period_start", &now.to_string())?;
+        save("ai_period_start", &now.to_string())?;
 
-        Ok(())
+        db.apply_fenced_ai_preference_writes(revision, &writes)
     }
 
     /// Check everything Settings sent, without writing anything: the provider,
@@ -1430,6 +1662,15 @@ impl AiService {
             ));
         }
         if input.provider != ai_server::PROVIDER_ID {
+            if probe_embedding {
+                Self::guard_legacy_embedding_change(
+                    db,
+                    &input.provider,
+                    input.embedding_model.as_deref(),
+                    None,
+                    policy.as_ref(),
+                )?;
+            }
             return Ok(PreparedAiSettings {
                 input,
                 server: None,
@@ -1465,6 +1706,17 @@ impl AiService {
             return Err(AppError::InvalidInput("Changing a keyed server endpoint requires entering its API key again or explicitly removing the stored key".into()));
         }
 
+        let managed = if probe_embedding {
+            Self::guard_legacy_embedding_change(
+                db,
+                &input.provider,
+                input.embedding_model.as_deref(),
+                Some(&plan),
+                policy.as_ref(),
+            )?
+        } else {
+            false
+        };
         let mut server_embedding = None;
         let embedding_model = input.embedding_model.as_deref().unwrap_or_default().trim();
         let previously_validated = Self::server_embedding_dimensions(db, &plan.base_url, embedding_model)?;
@@ -1482,6 +1734,7 @@ impl AiService {
         });
         let policy_changed = policy.is_some() && previous_policy.as_ref() != Some(&requested_policy);
         if probe_embedding
+            && !managed
             && plan.embedding_source == EmbeddingSource::Server
             && !embedding_model.is_empty()
             && (previously_validated.is_none() || policy_changed || previous_size == 0)
@@ -1530,33 +1783,60 @@ impl AiService {
     /// a keychain write is the step that can still fail (a refused macOS
     /// prompt), and it fails before any preference has changed.
     pub fn apply_ai_settings(db: &Database, prepared: PreparedAiSettings) -> Result<()> {
+        let revision = db.embedding_generation_control()?.revision;
         let PreparedAiSettings {
             input,
             server,
             server_embedding,
         } = prepared;
-        let openrouter_key = input.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty());
-        if let (Some(key), "openrouter") = (openrouter_key, input.provider.as_str()) {
-            Self::store_openrouter_api_key(db, key)?;
-        }
-        if let Some(plan) = &server {
-            ai_server::apply_key_change(db, &plan.key, Self::use_dev_ai_keys())?;
-            ai_server::store_server_settings(db, plan)?;
-        }
-        if let Some((validated, dimensions, actual)) = &server_embedding {
-            db.set_preference(ai_server::EMBED_VALIDATED_PREF, validated)?;
-            db.set_preference(ai_server::EMBED_DIMENSIONS_PREF, &dimensions.as_pref())?;
-            db.set_preference("openai_compatible_embedding_actual_dimensions", &actual.to_string())?;
-        }
-        Self::save_config(
+        let managed = Self::guard_legacy_embedding_change(
             db,
             &input.provider,
-            &input.model,
             input.embedding_model.as_deref(),
-            input.monthly_budget_usd,
-            input.thinking_enabled,
-            input.zero_data_retention,
-        )
+            server.as_ref(),
+            None,
+        )?;
+        if managed && server_embedding.is_some() {
+            return Err(AppError::InvalidInput("Embedding validation changed while settings were prepared; use the atomic embedding workflow or retry the chat-only save".into()));
+        }
+        let source = server
+            .as_ref()
+            .map(|plan| plan.embedding_source)
+            .unwrap_or(ai_server::load_server_settings(db)?.embedding_source);
+        let current = db.get_preference("ai_embedding_model")?;
+        let model =
+            if input.embedding_model.is_none() && current.as_deref().is_some_and(|model| model.trim().is_empty()) {
+                String::new()
+            } else {
+                plan_embedding_model(
+                    embedding_backend(&input.provider, source),
+                    input.embedding_model.as_deref(),
+                    current.as_deref(),
+                    Self::stored_embedding_model(db, &input.provider)?.as_deref(),
+                    Self::stored_embedding_model(db, "openrouter")?.as_deref(),
+                )
+                .model
+            };
+        let mut writes = Self::planned_ai_preference_writes(db, &input, &model, server.as_ref())?;
+        if let Some((validated, dimensions, actual)) = server_embedding {
+            writes.extend([
+                (ai_server::EMBED_VALIDATED_PREF.into(), Some(validated)),
+                (ai_server::EMBED_DIMENSIONS_PREF.into(), Some(dimensions.as_pref())),
+                (
+                    "openai_compatible_embedding_actual_dimensions".into(),
+                    Some(actual.to_string()),
+                ),
+            ]);
+        }
+        if let Some(plan) = &server {
+            writes.extend(ai_server::stage_key_change(db, &plan.key, Self::use_dev_ai_keys())?);
+        }
+        if input.provider == "openrouter" {
+            if let Some(key) = input.api_key.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
+                writes.extend(Self::stage_openrouter_api_key(key)?);
+            }
+        }
+        db.apply_fenced_ai_preference_writes(revision, &writes)
     }
 
     /// How the server embedding model `model` at `base_url` was validated, or
@@ -3603,5 +3883,145 @@ mod server_provider_tests {
             })
             .collect();
         assert_eq!(auth, vec![Some("Bearer sk-server".to_string()), None]);
+    }
+}
+
+#[cfg(test)]
+mod managed_settings_guard_tests {
+    use super::*;
+    use crate::db::embedding_generations::{Corpus, DimensionPolicy, EmbeddingProfile};
+
+    fn managed() -> (Arc<Database>, EmbeddingProfile) {
+        let db = Arc::new(Database::new_for_testing().unwrap());
+        let server = ai_server::plan_server_settings(
+            &ServerSettingsInput {
+                base_url: "http://localhost:9/v1".into(),
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        ai_server::store_server_settings(&db, &server).unwrap();
+        AiService::save_config(
+            &db,
+            ai_server::PROVIDER_ID,
+            "chat-one",
+            Some("fixture-embed"),
+            0.0,
+            None,
+            None,
+        )
+        .unwrap();
+        let profile = EmbeddingProfile {
+            version: 1,
+            backend: ai_server::PROVIDER_ID.into(),
+            endpoint: Some(server.base_url),
+            model: "fixture-embed".into(),
+            model_revision: Some("fixture-v1".into()),
+            dimension_policy: DimensionPolicy::Native,
+            dimensions: 4096,
+            query_format: "raw-query-v1".into(),
+            document_format: "emailops-documents-v1".into(),
+            preprocessing: "emailops-chunk-v1".into(),
+            normalization: "none".into(),
+            encoding: "float32-le".into(),
+            distance_metric: "cosine".into(),
+        };
+        let lease = db
+            .prepare_embedding_generation(
+                &profile,
+                &[Corpus::Emails],
+                db.embedding_generation_control().unwrap().revision,
+            )
+            .unwrap();
+        db.validate_embedding_generation(&lease).unwrap();
+        db.activate_embedding_generation(&lease).unwrap();
+        (db, profile)
+    }
+
+    fn input(model: &str) -> AiSettingsInput {
+        AiSettingsInput {
+            provider: ai_server::PROVIDER_ID.into(),
+            model: "chat-two".into(),
+            embedding_model: Some(model.into()),
+            server: Some(ServerSettingsInput {
+                base_url: "http://localhost:9/v1".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_chat_only_legacy_save_skips_probe_and_embedding_changes_require_atomic_workflow() {
+        let (db, _profile) = managed();
+        assert!(AiService::save_config(
+            &db,
+            ai_server::PROVIDER_ID,
+            "chat-two",
+            Some("different-embed"),
+            0.0,
+            None,
+            None
+        )
+        .is_err());
+        assert_eq!(
+            db.get_preference("ai_embedding_model").unwrap().as_deref(),
+            Some("fixture-embed")
+        );
+        let prepared = AiService::prepare_ai_settings(&db, input("fixture-embed"))
+            .await
+            .expect("chat-only save must not contact localhost:9 or probe");
+        AiService::apply_ai_settings(&db, prepared).unwrap();
+        assert_eq!(db.get_preference("ai_model").unwrap().as_deref(), Some("chat-two"));
+        assert!(AiService::prepare_ai_settings(&db, input("different-embed"))
+            .await
+            .is_err());
+        assert!(AiService::save_config(&db, "ollama", "chat", None, 0.0, None, None).is_err());
+        assert!(AiService::set_legacy_ai_preference(&db, "ai_embedding_model", "different-embed").is_err());
+        assert!(AiService::set_legacy_ai_preference(&db, "ai_provider", "ollama").is_err());
+        assert!(
+            AiService::set_legacy_ai_preference(&db, "openai_compatible_base_url", "http://localhost:10/v1").is_err()
+        );
+        assert!(AiService::set_legacy_ai_preference(&db, "openrouter_api_key_id", "old-reference").is_err());
+        AiService::set_legacy_ai_preference(&db, "ai_model", "chat-three").unwrap();
+        assert_eq!(db.get_preference("ai_model").unwrap().as_deref(), Some("chat-three"));
+        AiService::set_legacy_ai_preference(&db, "theme", "dark").unwrap();
+        assert_eq!(db.get_preference("theme").unwrap().as_deref(), Some("dark"));
+    }
+
+    #[tokio::test]
+    async fn explicit_opt_out_pauses_pending_preserves_active_and_revokes_an_existing_session() {
+        let (db, profile) = managed();
+        let fake = Arc::new(crate::ai::provider::FakeAiProvider::new().with_embedding_dim(4096));
+        let session = super::super::embedding_session::EmbeddingSession::new_for_testing(
+            db.clone(),
+            profile.clone(),
+            fake.clone(),
+        )
+        .unwrap();
+        let pending = db
+            .prepare_embedding_generation(
+                &profile,
+                &[Corpus::Emails],
+                db.embedding_generation_control().unwrap().revision,
+            )
+            .unwrap();
+        let active = db.embedding_generation_control().unwrap().active_id;
+        AiService::apply_embedding_opt_out(&db, input(""), db.embedding_generation_control().unwrap().revision)
+            .await
+            .unwrap();
+        assert_eq!(db.get_preference("ai_embedding_model").unwrap().as_deref(), Some(""));
+        assert_eq!(db.embedding_generation_control().unwrap().active_id, active);
+        assert_eq!(
+            db.embedding_generation_status(pending.generation_id).unwrap().state,
+            "paused"
+        );
+        assert!(session.embed("must remain private").await.is_err());
+        assert!(
+            fake.embed_calls().is_empty(),
+            "opt-out must revoke a frozen session before its next request"
+        );
     }
 }

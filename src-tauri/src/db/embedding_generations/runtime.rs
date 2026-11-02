@@ -63,17 +63,91 @@ pub struct GenerationVectorHit {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationCorpusStatus {
     pub corpus: Corpus,
     pub enabled: bool,
     pub requested_enabled: bool,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub completed: i64,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub failed: i64,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub pending: i64,
 }
 
 impl Database {
+    pub(crate) fn apply_fenced_ai_preference_writes(
+        &self,
+        expected_revision: i64,
+        preferences: &[(String, Option<String>)],
+    ) -> Result<()> {
+        let mut conn = self.connection();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if control(&tx)?.revision != expected_revision {
+            return invalid("AI settings changed while preparing the save; retry or use the atomic embedding workflow");
+        }
+        for (key, value) in preferences {
+            match value {
+                Some(value) => {
+                    tx.execute("INSERT INTO user_preferences(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value IS NOT excluded.value",params![key,value])?;
+                }
+                None => {
+                    tx.execute("DELETE FROM user_preferences WHERE key=?1", [key])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Disable is a settings transition, not an index rebuild. Its transaction
+    /// fences pending workers without deleting their completed work or any
+    /// active vector data, and publishes credential references with settings.
+    pub(crate) fn apply_embedding_opt_out_preferences(
+        &self,
+        expected_revision: i64,
+        preferences: &[(String, Option<String>)],
+    ) -> Result<()> {
+        if !preferences
+            .iter()
+            .any(|(key, value)| key == "ai_embedding_model" && value.as_deref() == Some(""))
+        {
+            return invalid("An explicit empty embedding selection is required");
+        }
+        let mut conn = self.connection();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if control(&tx)?.revision != expected_revision {
+            return invalid("AI settings changed; refresh before disabling Embeddings");
+        }
+        for (key, value) in preferences {
+            match value {
+                Some(value) => {
+                    tx.execute("INSERT INTO user_preferences(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value IS NOT excluded.value",params![key,value])?;
+                }
+                None => {
+                    tx.execute("DELETE FROM user_preferences WHERE key=?1", [key])?;
+                }
+            }
+        }
+        tx.execute("UPDATE embedding_generations SET state='paused',epoch=epoch+1,owner=NULL,lease_until=NULL,validation_json=NULL,error='Embeddings disabled; explicit resume requires an enabled selection' WHERE id=(SELECT pending_id FROM embedding_control) AND state IN ('preparing','building','validating','failed','interrupted')",[])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Cleanup from a queued/dropped worker must never stop a newer epoch.
+    pub(crate) fn finish_embedding_build_if_owned(
+        &self,
+        lease: &BuildLease,
+        failed: bool,
+        error: &str,
+    ) -> Result<bool> {
+        Ok(self.connection().execute("UPDATE embedding_generations SET state=?5,epoch=epoch+1,owner=NULL,lease_until=NULL,validation_json=NULL,error=?6 WHERE id=?1 AND epoch=?2 AND owner=?3 AND fingerprint=?4 AND id=(SELECT pending_id FROM embedding_control) AND state IN ('preparing','building','validating')",params![lease.generation_id,lease.epoch,lease.owner,lease.fingerprint,if failed {"failed"} else {"paused"},error])?==1)
+    }
     pub fn embedding_generation_corpus_status(&self, generation: i64) -> Result<Vec<GenerationCorpusStatus>> {
         let conn = self.reader();
         let mut stmt=conn.prepare("SELECT c.enabled,c.requested_enabled,(SELECT count(*) FROM embedding_generation_applicable_sources s JOIN embedding_generation_items i ON i.generation_id=s.generation_id AND i.corpus=s.corpus AND i.source_id=s.source_id AND i.source_revision=s.revision WHERE s.generation_id=c.generation_id AND s.corpus=c.corpus AND i.status='complete'),(SELECT count(*) FROM embedding_generation_applicable_sources s JOIN embedding_generation_items i ON i.generation_id=s.generation_id AND i.corpus=s.corpus AND i.source_id=s.source_id AND i.source_revision=s.revision WHERE s.generation_id=c.generation_id AND s.corpus=c.corpus AND i.status='failed'),(SELECT count(*) FROM embedding_generation_applicable_sources s WHERE s.generation_id=c.generation_id AND s.corpus=c.corpus AND NOT EXISTS(SELECT 1 FROM embedding_generation_items i WHERE i.generation_id=s.generation_id AND i.corpus=s.corpus AND i.source_id=s.source_id AND i.source_revision=s.revision AND i.status='complete')) FROM embedding_generation_corpora c WHERE generation_id=?1 AND corpus=?2")?;
@@ -183,7 +257,7 @@ impl Database {
         let mut conn = self.reader();
         let tx = conn.transaction()?;
         let enabled: bool = tx.query_row(
-            "SELECT coalesce((SELECT lower(value) FROM user_preferences WHERE key='ai_enabled'),'true')='true'",
+            "SELECT coalesce((SELECT lower(value) FROM user_preferences WHERE key='ai_enabled'),'true')='true' AND coalesce((SELECT trim(value) FROM user_preferences WHERE key='ai_embedding_model'),'configured')<>''",
             [],
             |r| r.get(0),
         )?;

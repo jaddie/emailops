@@ -1,3 +1,22 @@
+import type {
+  EmbeddingBuildPreview,
+  EmbeddingDimensionPolicy,
+  EmbeddingLifecycle,
+  EmbeddingSettingsInput,
+  ServerSettingsInput,
+} from '@/types';
+
+export type {
+  EmbeddingBuildPreview,
+  EmbeddingCorpus,
+  EmbeddingDimensionPolicy,
+  EmbeddingGeneration,
+  EmbeddingLifecycle,
+  EmbeddingProfile,
+  EmbeddingSettingsInput,
+  ServerSettingsInput,
+} from '@/types';
+
 import { getVersion } from '@tauri-apps/api/app';
 import { invoke } from '@tauri-apps/api/core';
 import { arch as osArch, platform as osPlatform, version as osVersion } from '@tauri-apps/plugin-os';
@@ -1169,21 +1188,6 @@ export async function setAiConfig(
     zeroDataRetention,
     server,
   });
-}
-
-/** What Settings sends for the OpenAI-compatible server
- *  (`services::ai_server::ServerSettingsInput`). */
-export interface ServerSettingsInput {
-  baseUrl: string;
-  /** A new key; null keeps the stored one. */
-  apiKey: string | null;
-  /** Delete the stored key. */
-  clearApiKey: boolean;
-  embeddingSource: 'server' | 'inapp' | 'openrouter';
-  /** Tokens; 0 reads it from the server. */
-  contextWindow: number;
-  /** The remote host whose disclosure the user just confirmed. */
-  disclosureAcceptedHost: string | null;
 }
 
 /** Models an OpenAI-compatible server lists at `GET {baseUrl}/models`. The
@@ -2464,4 +2468,32 @@ export async function setJunkConfig(config: JunkConfig): Promise<void> {
 
 export async function getJunkStats(accountId: string): Promise<JunkStats> {
   return invoke('get_junk_stats', { accountId });
+}
+
+export async function getEmbeddingLifecycle(): Promise<EmbeddingLifecycle> {
+  return invoke('get_embedding_lifecycle');
+}
+export async function previewEmbeddingSettings(
+  input: EmbeddingSettingsInput,
+  policy: EmbeddingDimensionPolicy,
+): Promise<EmbeddingBuildPreview> {
+  return invoke('preview_embedding_settings', { input, policy });
+}
+export async function commitEmbeddingSettings(
+  input: EmbeddingSettingsInput,
+  policy: EmbeddingDimensionPolicy,
+  preview: EmbeddingBuildPreview,
+): Promise<void> {
+  return invoke('commit_embedding_settings', { input, policy, preview });
+}
+export async function controlEmbeddingBuild(
+  action: 'stop' | 'resume' | 'discard' | 'rollback',
+  generation: number | null,
+  revision: number,
+): Promise<void> {
+  return invoke('control_embedding_build', { action, generation, revision });
+}
+
+export async function disableEmbeddingSettings(input: EmbeddingSettingsInput, expectedRevision: number): Promise<void> {
+  return invoke('disable_embedding_settings', { input, expectedRevision });
 }

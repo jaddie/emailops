@@ -35,6 +35,11 @@ vi.mock('./AiSettings/ChatPromptsSection', () => ({ ChatPromptsSection: () => nu
 vi.mock('./AiSettings/openRouterEmbeddingModels', () => ({ RECOMMENDED_OPENROUTER_EMBEDDING_MODELS: [] }));
 
 const api = vi.hoisted(() => ({
+  getEmbeddingLifecycle: vi.fn(() => Promise.resolve({ revision: 0, active: null, pending: null, retained: null })),
+  previewEmbeddingSettings: vi.fn(() => Promise.resolve({ profile: { model: 'test', dimensions: 768 } })),
+  commitEmbeddingSettings: vi.fn(() => Promise.resolve()),
+  controlEmbeddingBuild: vi.fn(() => Promise.resolve()),
+  disableEmbeddingSettings: vi.fn(() => Promise.resolve()),
   getAiConfig: vi.fn(),
   detectAiCapability: vi.fn(() => Promise.resolve({ embeddedAiAvailable: true as boolean })),
   listCatalogModels: vi.fn(() =>
@@ -219,6 +224,30 @@ describe('AiSettings — OpenAI-compatible server', () => {
     return calls[calls.length - 1][7] as Record<string, unknown>;
   }
 
+  it('defaults a newly selected server embedding model to Native', async () => {
+    await mount({ baseUrl: 'http://localhost:1234', embeddingSource: 'server' });
+    await type('settings:ai.embeddingModel', 'new-4096-model');
+    expect((container.querySelector('[data-testid=embedding-policy]') as HTMLSelectElement).value).toBe('native');
+    await click('common:actions.save');
+    expect(api.previewEmbeddingSettings).toHaveBeenCalledWith(expect.anything(), 'Native');
+  });
+
+  it('shows an ignored explicit dimensions error without saving', async () => {
+    await mount({ baseUrl: 'http://localhost:1234', embeddingSource: 'server' });
+    await type('settings:ai.embeddingModel', 'new-model');
+    const select = container.querySelector('[data-testid=embedding-policy]') as HTMLSelectElement;
+    act(() => {
+      select.value = 'explicit';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    api.previewEmbeddingSettings.mockRejectedValueOnce(
+      new Error('Embedding returned 4096 dimensions; expected 768. Select Native'),
+    );
+    await click('common:actions.save');
+    expect(container.textContent).toContain('Embedding returned 4096 dimensions; expected 768. Select Native');
+    expect(api.commitEmbeddingSettings).not.toHaveBeenCalled();
+  });
+
   it('saves a server on this machine without asking anything', async () => {
     await mount();
     await click('common:actions.save');
@@ -246,11 +275,19 @@ describe('AiSettings — OpenAI-compatible server', () => {
 
     await click('settings:server.disclosureConfirm');
 
-    expect(api.setAiConfig).toHaveBeenCalledTimes(1);
-    expect(savedServer()).toMatchObject({
-      baseUrl: 'https://llm.example.com/v1',
-      disclosureAcceptedHost: 'llm.example.com',
-    });
+    expect(container.textContent).toContain('settings:embeddingLifecycle.disableWarning');
+    expect(api.disableEmbeddingSettings).not.toHaveBeenCalled();
+    await click('settings:embeddingLifecycle.disable');
+    expect(api.disableEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        server: expect.objectContaining({
+          baseUrl: 'https://llm.example.com/v1',
+          disclosureAcceptedHost: 'llm.example.com',
+        }),
+      }),
+      0,
+    );
+    expect(api.previewEmbeddingSettings).not.toHaveBeenCalled();
   });
 
   it('saves nothing when the disclosure is declined', async () => {
@@ -334,8 +371,8 @@ describe('AiSettings — OpenAI-compatible server', () => {
     await settle();
     await click('common:actions.save');
 
-    expect(container.textContent).toContain('settings:confirmReindex.title');
-    expect(container.textContent).toContain('settings:confirmReindex.openRouter');
+    expect(container.textContent).toContain('settings:embeddingLifecycle.warning');
+    expect(container.textContent).toContain('settings:embeddingLifecycle.warning');
   });
 
   it('tests the server typed in, with the key typed in', async () => {

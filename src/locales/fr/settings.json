@@ -208,7 +208,7 @@
     "embeddingRecommendedEnglish": "recommandé, anglais uniquement",
     "embeddingNotice": "Avec un modèle d'Embeddings sélectionné, le texte de chaque e-mail indexé, ainsi que de chaque recherche et question du chat, est envoyé à OpenRouter et compte dans le budget mensuel. Sans modèle, la recherche sémantique est désactivée et la recherche se fait uniquement par mots-clés.",
     "embeddingNeedsKey": "Enregistrez votre clé API pour charger la liste des modèles d'Embeddings.",
-    "embeddingNeedsCheck": "L'enregistrement vérifie que ce modèle produit les vecteurs de 768 dimensions dont l'index des e-mails a besoin.",
+    "embeddingNeedsCheck": "L’enregistrement vérifie le modèle et les dimensions sélectionnés avant de créer un nouvel index.",
     "embeddingCheckFailed": "Rien n'a été enregistré : le modèle d'Embeddings ne peut pas être utilisé : {{error}}",
     "embeddingZdrBlocked": "Rien n'a été enregistré : aucun fournisseur du modèle d'Embeddings {{model}} ne respecte le réglage de rétention zéro. Désactivez « Rétention zéro uniquement » dans Paramètres → IA → OpenRouter, ou n'utilisez aucun modèle d'Embeddings (recherche par mots-clés uniquement).",
     "embeddingListFailed": "Échec du chargement des modèles d'Embeddings d'OpenRouter : {{error}}"
@@ -250,14 +250,6 @@
     "disclosureRetention": "EmailOps ne peut pas contrôler si ce serveur, ou un service derrière lui, conserve ce contenu ou entraîne des modèles avec. Ne continuez que si vous faites confiance au serveur.",
     "disclosureLocalHint": "Pour garder le courrier sur un réseau que vous contrôlez, accédez au serveur par un tunnel SSH ou Tailscale et utilisez http://localhost.",
     "disclosureConfirm": "Envoyer à ce serveur"
-  },
-  "confirmReindex": {
-    "title": "Régénérer tous les Embeddings ?",
-    "body": "Le modèle d'Embeddings a changé. L'enregistrement supprime tous les Embeddings existants et les régénère avec le nouveau modèle. La recherche sémantique est réduite jusqu'à la fin de l'opération.",
-    "bodyNone": "Aucun modèle d'Embeddings n'est sélectionné. L'enregistrement supprime tous les Embeddings existants et désactive la recherche sémantique : la recherche se fait uniquement par mots-clés jusqu'à ce que vous choisissiez un modèle.",
-    "openRouter": "Le texte de chaque e-mail indexé sera envoyé à OpenRouter et facturé sur votre compte OpenRouter.",
-    "confirm": "Enregistrer et régénérer",
-    "confirmNone": "Enregistrer et supprimer"
   },
   "aiWork": {
     "title": "Travail d’IA en cours",
@@ -746,5 +738,47 @@
     "website": "Site web",
     "sourceCode": "Code source sur GitHub",
     "sponsor": "Soutenir le projet ♥"
+  },
+  "embeddingLifecycle": {
+    "title": "Index des embeddings",
+    "warning": "Les changements créent un index à côté de l’index actif et peuvent envoyer des données au fournisseur choisi. Les anciens index ne sont pas vérifiés ; la recherche textuelle est utilisée jusqu’à la création d’un index vérifié.",
+    "identity": "La révision du modèle peut être indisponible ; l’identité observée ne garantit pas que le modèle du serveur soit inchangé.",
+    "active": "Actif",
+    "pending": "En attente",
+    "retained": "Conservé",
+    "legacy": "Ancien index non vérifié",
+    "noRevision": "Révision du serveur indisponible",
+    "failed": "Échecs",
+    "disabled": "(désactivé)",
+    "dimensions": "Dimensions",
+    "native": "Natives (détecter)",
+    "explicit": "Explicites",
+    "preview": "Prévisualiser et créer",
+    "stop": "Arrêter",
+    "resume": "Reprendre / réessayer",
+    "discard": "Abandonner",
+    "rollback": "Rétablir",
+    "Emails": "E-mails",
+    "MemoryFacts": "Mémoire",
+    "HelpDocs": "Documents d’aide",
+    "confirm": "Créer et activer {{model}} avec {{dimensions}} dimensions détectées ? Tout index actif vérifié reste disponible pendant la création.",
+    "requested": "Demandées",
+    "detected": "Détectées",
+    "activate": "Créer et activer",
+    "state": {
+      "active": "Actif",
+      "retained": "Conservé",
+      "legacy_unverified": "Ancien, non vérifié",
+      "preparing": "Préparation",
+      "building": "Création",
+      "validating": "Validation",
+      "paused": "En pause",
+      "failed": "Échec",
+      "interrupted": "Interrompu",
+      "repair": "Réparation requise"
+    },
+    "disableTitle": "Désactiver les embeddings",
+    "disableWarning": "La récupération sémantique utilisera la recherche textuelle. Les index existants sont conservés et toute création en attente est arrêtée.",
+    "disable": "Désactiver les embeddings"
   }
 }

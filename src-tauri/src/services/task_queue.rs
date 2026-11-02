@@ -218,6 +218,19 @@ impl TaskQueue {
         self.enqueue(name, TaskPriority::Background, Box::pin(task))
     }
 
+    /// Durable jobs need to surface an enqueue failure and observe cancellation
+    /// while still pending. Other callers retain the existing submit API.
+    pub fn try_submit_named<'a, F>(
+        &'a self,
+        name: &'a str,
+        task: F,
+    ) -> impl Future<Output = crate::models::error::Result<TaskInfo>> + Send + 'a
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.enqueue_checked(name, TaskPriority::Background, Box::pin(task))
+    }
+
     /// Submit a task the user is waiting on, so it goes ahead of the
     /// background maintenance already queued.
     ///
@@ -247,6 +260,16 @@ impl TaskQueue {
 
     /// Queue an already-boxed task. The only `async` step of submitting.
     async fn enqueue(&self, name: &str, priority: TaskPriority, fut: BoxFuture) {
+        // Existing submissions log the checked error at the common boundary.
+        let _ = self.enqueue_checked(name, priority, fut).await;
+    }
+
+    async fn enqueue_checked(
+        &self,
+        name: &str,
+        priority: TaskPriority,
+        fut: BoxFuture,
+    ) -> crate::models::error::Result<TaskInfo> {
         // Lazy-start the consumer
         {
             let mut started = self.started.lock().await;
@@ -298,6 +321,17 @@ impl TaskQueue {
                     self.name, name
                 ),
             );
+            return Err(crate::models::error::AppError::InvalidInput(
+                "The AI queue is unavailable; the embedding build was paused and can be resumed explicitly".into(),
+            ));
+        }
+        Ok(info)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn close_for_testing(&self) {
+        if let Some(receiver) = self.receiver.lock().await.as_mut() {
+            receiver.close();
         }
     }
 

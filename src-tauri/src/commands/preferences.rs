@@ -128,7 +128,7 @@ fn is_new_mail_notification_switch(key: &str) -> bool {
 #[tauri::command]
 pub async fn set_pref(app: AppHandle, state: State<'_, AppState>, key: String, value: String) -> Result<(), AppError> {
     validate_pref(&key, &value)?;
-    state.db.set_preference(&key, &value)?;
+    crate::services::ai::AiService::set_legacy_ai_preference(&state.db, &key, &value)?;
 
     // When AI provider/model preferences change (e.g. the LogPanel quick
     // selector flips backend), broadcast `ai-config-updated` so AI Settings,

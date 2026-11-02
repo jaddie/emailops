@@ -32,3 +32,10 @@ credentials, then atomically publish preference writes plus the candidate job.
 `preview_build`/`commit_build` remain the lower-level profile-only path when the
 trusted provider settings already exist. See the database module's commit-boundary
 and orphan-secret rules; frontend code must not compose separate save/rebuild calls.
+
+AI Backend & Models exposes a credential-free lifecycle snapshot (active, pending
+and retained generations), actual dimensions, opaque identity warning and
+per-corpus progress. Settings preview the unsaved configuration with neutral
+input and confirm before the atomic settings/build commit; stop, resume, discard
+and rollback remain explicit. Account-scoped rebuilds use the managed generation workflow. Existing unverified legacy
+indexes remain intact and retrieval falls back to FTS until activation.

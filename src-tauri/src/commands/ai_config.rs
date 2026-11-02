@@ -59,10 +59,12 @@ pub struct AiProviderActivity {
 
 #[tauri::command]
 pub async fn get_ai_provider_activity(state: State<'_, AppState>) -> Result<AiProviderActivity, AppError> {
+    let mut items = ai_activity::provider_work(&state.ai_background.snapshot());
+    items.extend(ai_activity::provider_work(&state.ai_queue.snapshot()));
     Ok(AiProviderActivity {
         provider: AiService::get_config(&state.db)?.provider,
         embedding_provider: AiService::embedding_provider(&state.db)?,
-        items: ai_activity::provider_work(&state.ai_background.snapshot()),
+        items,
     })
 }
 
@@ -74,7 +76,8 @@ pub async fn cancel_ai_provider_work(
     state: State<'_, AppState>,
     kinds: Vec<AiWorkKind>,
 ) -> Result<usize, AppError> {
-    let asked = ai_activity::cancel_provider_work(&state.ai_background, &kinds);
+    let asked = ai_activity::cancel_provider_work(&state.ai_background, &kinds)
+        + ai_activity::cancel_provider_work(&state.ai_queue, &kinds);
     if asked > 0 {
         emit_log(
             &app,
@@ -402,4 +405,140 @@ pub async fn test_ai_provider(
         ),
     );
     Ok(result.text)
+}
+
+/// Credential-free lifecycle DTOs; ownership leases never cross the command boundary.
+#[derive(serde::Serialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
+pub struct EmbeddingGenerationSnapshot {
+    pub status: crate::db::embedding_generations::GenerationStatus,
+    pub profile: Option<crate::db::embedding_generations::EmbeddingProfile>,
+    pub corpora: Vec<crate::db::embedding_generations::GenerationCorpusStatus>,
+}
+
+#[derive(serde::Serialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
+pub struct EmbeddingLifecycle {
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub revision: i64,
+    pub active: Option<EmbeddingGenerationSnapshot>,
+    pub pending: Option<EmbeddingGenerationSnapshot>,
+    pub retained: Option<EmbeddingGenerationSnapshot>,
+}
+
+#[tauri::command]
+pub async fn get_embedding_lifecycle(state: State<'_, AppState>) -> Result<EmbeddingLifecycle, AppError> {
+    let control = state.db.embedding_generation_control()?;
+    let generation = |id: Option<i64>| -> Result<Option<EmbeddingGenerationSnapshot>, AppError> {
+        id.map(|id| {
+            Ok(EmbeddingGenerationSnapshot {
+                status: state.db.embedding_generation_status(id)?,
+                profile: if id == 0 {
+                    None
+                } else {
+                    Some(state.db.embedding_generation_profile(id)?)
+                },
+                corpora: state.db.embedding_generation_corpus_status(id)?,
+            })
+        })
+        .transpose()
+    };
+    Ok(EmbeddingLifecycle {
+        revision: control.revision,
+        active: generation(control.active_id)?,
+        pending: generation(control.pending_id)?,
+        retained: generation(control.retained_id)?,
+    })
+}
+
+#[tauri::command]
+pub async fn preview_embedding_settings(
+    state: State<'_, AppState>,
+    input: AiSettingsInput,
+    policy: crate::db::embedding_generations::DimensionPolicy,
+) -> Result<services::embedding_runtime::EmbeddingBuildPreview, AppError> {
+    use crate::db::embedding_generations::Corpus;
+    let mut corpora = vec![Corpus::Emails];
+    if state.db.is_memory_enabled()? {
+        corpora.push(Corpus::MemoryFacts);
+    }
+    if state.db.is_help_docs_enabled()? {
+        corpora.push(Corpus::HelpDocs);
+    }
+    services::embedding_runtime::preview_settings_build(&state.db, input, policy, &corpora).await
+}
+
+async fn queue_embedding_build(
+    state: &AppState,
+    lease: crate::db::embedding_generations::BuildLease,
+) -> Result<(), AppError> {
+    services::embedding_runtime::enqueue_build(state.db.clone(), &state.ai_queue, lease).await
+}
+
+#[tauri::command]
+pub async fn commit_embedding_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: AiSettingsInput,
+    policy: crate::db::embedding_generations::DimensionPolicy,
+    preview: services::embedding_runtime::EmbeddingBuildPreview,
+) -> Result<(), AppError> {
+    let lease = services::embedding_runtime::commit_settings_build(&state.db, input, policy, &preview).await?;
+    let _ = app.emit("ai-config-updated", serde_json::Value::Null);
+    queue_embedding_build(&state, lease).await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn control_embedding_build(
+    state: State<'_, AppState>,
+    action: String,
+    generation: Option<i64>,
+    revision: i64,
+) -> Result<(), AppError> {
+    match action.as_str() {
+        "stop" => state.db.stop_embedding_generation(
+            generation.ok_or_else(|| AppError::InvalidInput("Missing generation".into()))?,
+            false,
+            None,
+        )?,
+        "discard" => state.db.discard_embedding_generation(
+            generation.ok_or_else(|| AppError::InvalidInput("Missing generation".into()))?,
+        )?,
+        "resume" => {
+            let lease = services::embedding_runtime::resume_build(
+                &state.db,
+                generation.ok_or_else(|| AppError::InvalidInput("Missing generation".into()))?,
+                revision,
+            )
+            .await?;
+            queue_embedding_build(&state, lease).await?;
+        }
+        "rollback" => {
+            let lease = services::embedding_runtime::rollback_build(&state.db, revision).await?;
+            queue_embedding_build(&state, lease).await?;
+        }
+        _ => return Err(AppError::InvalidInput("Unknown embedding action".into())),
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn disable_embedding_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    input: AiSettingsInput,
+    expected_revision: i64,
+) -> Result<(), AppError> {
+    AiService::apply_embedding_opt_out(&state.db, input, expected_revision).await?;
+    let _ = app.emit("ai-config-updated", serde_json::Value::Null);
+    Ok(())
 }

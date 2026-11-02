@@ -208,7 +208,7 @@
     "embeddingRecommendedEnglish": "recomendado, solo inglés",
     "embeddingNotice": "Con un modelo de Embeddings seleccionado, el texto de cada correo que se indexa, y de cada búsqueda y pregunta del chat, se envía a OpenRouter y cuenta para el presupuesto mensual. Sin ninguno, la búsqueda semántica está desactivada y solo se busca por palabras clave.",
     "embeddingNeedsKey": "Guarda tu clave de API para cargar la lista de modelos de Embeddings.",
-    "embeddingNeedsCheck": "Al guardar se comprueba que este modelo genera los vectores de 768 dimensiones que necesita el índice de correo.",
+    "embeddingNeedsCheck": "Al guardar se comprueban el modelo y las dimensiones seleccionadas antes de crear un índice nuevo.",
     "embeddingCheckFailed": "No se ha guardado nada: el modelo de Embeddings no se puede usar: {{error}}",
     "embeddingZdrBlocked": "No se ha guardado nada: ningún proveedor del modelo de Embeddings {{model}} cumple el ajuste de retención cero. Desactiva «Solo retención cero» en Ajustes → IA → OpenRouter, o no uses ningún modelo de Embeddings (solo búsqueda por palabras clave).",
     "embeddingListFailed": "No se pudieron cargar los modelos de Embeddings de OpenRouter: {{error}}"
@@ -250,14 +250,6 @@
     "disclosureRetention": "EmailOps no puede controlar si ese servidor, o un servicio detrás de él, conserva este contenido o entrena modelos con él. Continúa solo si confías en el servidor.",
     "disclosureLocalHint": "Para que el correo no salga de una red que controlas, accede al servidor por un túnel SSH o Tailscale y usa http://localhost.",
     "disclosureConfirm": "Enviar a este servidor"
-  },
-  "confirmReindex": {
-    "title": "¿Regenerar todos los Embeddings?",
-    "body": "El modelo de Embeddings ha cambiado. Al guardar se eliminan todos los Embeddings existentes y se regeneran con el nuevo modelo. La búsqueda semántica queda reducida hasta que termine.",
-    "bodyNone": "No hay ningún modelo de Embeddings seleccionado. Al guardar se eliminan todos los Embeddings existentes y la búsqueda semántica se desactiva: solo se busca por palabras clave hasta que elijas un modelo.",
-    "openRouter": "El texto de cada correo indexado se enviará a OpenRouter y se facturará en tu cuenta de OpenRouter.",
-    "confirm": "Guardar y regenerar",
-    "confirmNone": "Guardar y eliminar"
   },
   "aiWork": {
     "title": "Hay trabajo de IA en curso",
@@ -746,5 +738,47 @@
     "website": "Sitio web",
     "sourceCode": "Código fuente en GitHub",
     "sponsor": "Apoya el proyecto ♥"
+  },
+  "embeddingLifecycle": {
+    "title": "Índice de embeddings",
+    "warning": "Los cambios crean un índice nuevo junto al activo y pueden enviar datos al proveedor seleccionado. Los índices anteriores no están verificados; se usa la búsqueda de texto hasta completar uno verificado.",
+    "identity": "Es posible que no haya revisión del modelo; la identidad observada no garantiza que el servidor no haya cambiado el modelo.",
+    "active": "Activo",
+    "pending": "Pendiente",
+    "retained": "Conservado",
+    "legacy": "Índice anterior sin verificar",
+    "noRevision": "Revisión del servidor no disponible",
+    "failed": "Errores",
+    "disabled": "(desactivado)",
+    "dimensions": "Dimensiones",
+    "native": "Nativas (detectar)",
+    "explicit": "Explícitas",
+    "preview": "Previsualizar y crear",
+    "stop": "Detener",
+    "resume": "Reanudar / reintentar",
+    "discard": "Descartar",
+    "rollback": "Revertir",
+    "Emails": "Correos",
+    "MemoryFacts": "Memoria",
+    "HelpDocs": "Documentos de ayuda",
+    "confirm": "¿Crear y activar {{model}} con {{dimensions}} dimensiones detectadas? Si existe un índice activo verificado, seguirá disponible durante la creación.",
+    "requested": "Solicitadas",
+    "detected": "Detectadas",
+    "activate": "Crear y activar",
+    "state": {
+      "active": "Activo",
+      "retained": "Conservado",
+      "legacy_unverified": "Anterior, sin verificar",
+      "preparing": "Preparando",
+      "building": "Creando",
+      "validating": "Validando",
+      "paused": "Pausado",
+      "failed": "Fallido",
+      "interrupted": "Interrumpido",
+      "repair": "Requiere reparación"
+    },
+    "disableTitle": "Desactivar embeddings",
+    "disableWarning": "La recuperación semántica usará la búsqueda de texto. Se conservan los índices existentes y se detiene cualquier creación pendiente.",
+    "disable": "Desactivar embeddings"
   }
 }

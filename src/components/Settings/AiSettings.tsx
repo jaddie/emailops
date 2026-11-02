@@ -12,14 +12,15 @@ import type { AiConfig, AiModelInfo, AiProviderActivity, CatalogModel, ModelDown
 import { AiSharedPreferences } from './AiSettings/AiSharedPreferences';
 import { ChatPromptsSection } from './AiSettings/ChatPromptsSection';
 import { ConfirmDisableDialog } from './AiSettings/ConfirmDisableDialog';
-import { ConfirmReindexDialog } from './AiSettings/ConfirmReindexDialog';
+import { ConfirmEmbeddingBuildDialog } from './AiSettings/ConfirmEmbeddingBuildDialog';
+import { ConfirmEmbeddingOptOutDialog } from './AiSettings/ConfirmEmbeddingOptOutDialog';
 import { EmbeddedPanel } from './AiSettings/EmbeddedPanel';
+import { EmbeddingLifecycle } from './AiSettings/EmbeddingLifecycle';
 import {
   chatModelForProvider,
   contextBudgetFromPref,
   contextBudgetToPref,
   DEFAULT_CONTEXT_BUDGET,
-  embeddingModelChanged,
   embeddingModelForProvider,
   needsEmbeddingProbe,
 } from './AiSettings/helpers';
@@ -31,6 +32,22 @@ import { ServerPanel } from './AiSettings/ServerPanel';
 import { contextKey, disclosureHost, sendsIndexToOpenRouter } from './AiSettings/serverSettings';
 import { type AiConfigState, DEFAULT_ROUTING_MODE, isRoutingMode, type RoutingMode } from './AiSettings/types';
 import { SettingsPanel } from './SettingsPanel';
+
+function embeddingIdentity(
+  provider: string,
+  model: string,
+  server: { baseUrl?: string | null; embeddingSource: string } | null | undefined,
+): string {
+  const backend =
+    provider === 'openai_compatible'
+      ? server?.embeddingSource === 'inapp'
+        ? 'llamacpp'
+        : server?.embeddingSource === 'openrouter'
+          ? 'openrouter'
+          : 'openai_compatible'
+      : provider;
+  return JSON.stringify([backend, model, backend === 'openai_compatible' ? (server?.baseUrl ?? '').trim() : null]);
+}
 
 /**
  * AI configuration screen. Owns provider selection, model + key state,
@@ -45,7 +62,6 @@ export function AiSettings() {
   const { enabled: aiEnabled, setEnabled: setAiEnabled } = useAiStore();
   const [confirmDisable, setConfirmDisable] = useState(false);
   // Save is waiting for the user to accept that the email index is rebuilt.
-  const [confirmReindex, setConfirmReindex] = useState(false);
   // Save is waiting for the user to stop, or wait for, the background AI work
   // the change cuts across. Asked before the re-index confirmation.
   const [workInProgress, setWorkInProgress] = useState<{ change: AiChange; activity: AiProviderActivity } | null>(null);
@@ -104,6 +120,13 @@ export function AiSettings() {
   // enabled meanwhile so a slow probe can't hide a working option.
   const [embeddedAvailable, setEmbeddedAvailable] = useState<boolean | null>(null);
   const [saving, setSaving] = useState(false);
+  const [confirmEmbeddingOptOut, setConfirmEmbeddingOptOut] = useState(false);
+  const [buildPreview, setBuildPreview] = useState<api.EmbeddingBuildPreview | null>(null);
+  const buildDecisionRef = useRef<((yes: boolean) => void) | null>(null);
+  const [dimensionPolicy, setDimensionPolicy] = useState<api.EmbeddingDimensionPolicy>({ Explicit: 768 });
+  const savedEmbeddingConfigRef = useRef('');
+  const forceEmbeddingBuildRef = useRef(false);
+  const savedPolicyRef = useRef<api.EmbeddingDimensionPolicy>({ Explicit: 768 });
   const [testing, setTesting] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -227,6 +250,16 @@ export function AiSettings() {
           disclosedHost: cfg.server.disclosedHost,
         },
       });
+      savedEmbeddingConfigRef.current = embeddingIdentity(cfg.provider, cfg.embeddingModel, cfg.server);
+      try {
+        const lifecycle = await api.getEmbeddingLifecycle();
+        const policy = lifecycle.pending?.profile?.dimension_policy ??
+          lifecycle.active?.profile?.dimension_policy ?? { Explicit: 768 };
+        savedPolicyRef.current = policy;
+        setDimensionPolicy(policy);
+      } catch {
+        /* Existing settings remain available if status cannot be read. */
+      }
       savedEmbedModelRef.current = cfg.embeddingModel;
       savedBackendRef.current = { provider: cfg.provider, model: cfg.model };
       rememberedRef.current = cfg.remembered;
@@ -364,6 +397,7 @@ export function AiSettings() {
 
   const handleProviderChange = (p: AiConfigState['provider']) => {
     if (!config) return;
+    if (p === 'openai_compatible' && p !== config.provider) setDimensionPolicy('Native');
     setConfig({
       ...config,
       provider: p,
@@ -441,16 +475,19 @@ export function AiSettings() {
     // it is and every request would fail.
     if (config.provider === 'openrouter' && config.model.trim() === '') {
       setError(t('settings:openRouter.chatModelRequired'));
+      forceEmbeddingBuildRef.current = false;
       return;
     }
     acceptedHostRef.current = null;
     if (config.provider === 'openai_compatible' && config.server) {
       if (config.server.baseUrl.trim() === '') {
         setError(t('settings:server.baseUrlRequired'));
+        forceEmbeddingBuildRef.current = false;
         return;
       }
       if (config.model.trim() === '') {
         setError(t('settings:server.chatModelRequired'));
+        forceEmbeddingBuildRef.current = false;
         return;
       }
       // Mail is about to go to another machine: say so before anything else.
@@ -494,11 +531,6 @@ export function AiSettings() {
 
   const confirmReindexOrSave = () => {
     if (!config) return;
-    // A changed embedding model deletes and rebuilds the whole index: ask first.
-    if (embeddingModelChanged(savedEmbedModelRef.current, config.embeddingModel)) {
-      setConfirmReindex(true);
-      return;
-    }
     void save();
   };
 
@@ -506,7 +538,6 @@ export function AiSettings() {
     if (!config) return;
     setSaving(true);
     try {
-      const prevEmbedModel = savedEmbedModelRef.current;
       const wantsApiKey = config.provider === 'openrouter';
       const key = wantsApiKey && apiKey ? apiKey : null;
       const server =
@@ -521,31 +552,58 @@ export function AiSettings() {
             }
           : undefined;
 
-      // An OpenRouter embedding model must fit the email index before it is
-      // saved: nothing is written when the check fails.
-      if (needsEmbeddingProbe(config, validatedEmbedModelRef.current)) {
+      const input: api.EmbeddingSettingsInput = {
+        provider: config.provider,
+        model: config.model,
+        embeddingModel: config.embeddingModel,
+        apiKey: key,
+        monthlyBudgetUsd: config.monthlyBudgetUsd,
+        thinkingEnabled: config.thinkingEnabled,
+        zeroDataRetention: config.zeroDataRetention,
+        server: server ?? null,
+      };
+      const embeddingChanged =
+        savedEmbeddingConfigRef.current !== embeddingIdentity(config.provider, config.embeddingModel, config.server) ||
+        JSON.stringify(dimensionPolicy) !== JSON.stringify(savedPolicyRef.current);
+      const build = forceEmbeddingBuildRef.current || embeddingChanged;
+      forceEmbeddingBuildRef.current = false;
+      if (build && !config.embeddingModel.trim()) {
+        const lifecycle = await api.getEmbeddingLifecycle();
+        setConfirmEmbeddingOptOut(true);
+        const confirmed = await new Promise<boolean>((resolve) => {
+          buildDecisionRef.current = resolve;
+        });
+        if (!confirmed) return;
+        await api.disableEmbeddingSettings(input, lifecycle.revision);
+      } else if (build) {
+        let preview: api.EmbeddingBuildPreview;
         try {
-          await api.validateOpenRouterEmbeddingModel(config.embeddingModel, key, config.zeroDataRetention);
+          preview = await api.previewEmbeddingSettings(input, dimensionPolicy);
         } catch (err) {
-          setError(
-            config.zeroDataRetention && isDataPolicyError(err)
-              ? t('settings:openRouter.embeddingZdrBlocked', { model: config.embeddingModel })
-              : t('settings:openRouter.embeddingCheckFailed', { error: errorText(err) }),
-          );
-          return;
+          if (config.zeroDataRetention && isDataPolicyError(err)) {
+            setError(t('settings:openRouter.embeddingZdrBlocked', { model: config.embeddingModel }));
+            return;
+          }
+          throw err;
         }
+        setBuildPreview(preview);
+        const confirmed = await new Promise<boolean>((resolve) => {
+          buildDecisionRef.current = resolve;
+        });
+        if (!confirmed) return;
+        await api.commitEmbeddingSettings(input, dimensionPolicy, preview);
+      } else {
+        await api.setAiConfig(
+          config.provider,
+          config.model,
+          config.embeddingModel,
+          key,
+          config.monthlyBudgetUsd,
+          config.thinkingEnabled,
+          config.zeroDataRetention,
+          server,
+        );
       }
-
-      await api.setAiConfig(
-        config.provider,
-        config.model,
-        config.embeddingModel,
-        key,
-        config.monthlyBudgetUsd,
-        config.thinkingEnabled,
-        config.zeroDataRetention,
-        server,
-      );
       savedEmbedModelRef.current = config.embeddingModel;
       setServerApiKey('');
       setClearServerKey(false);
@@ -612,18 +670,9 @@ export function AiSettings() {
         }
       }
 
-      // Trigger full re-index if the embedding model changed.
-      const embedChanged = embeddingModelChanged(prevEmbedModel, config.embeddingModel);
-      if (embedChanged) {
-        addLog('info', 'ai', t('settings:ai.reindexStarting'));
-        try {
-          await api.regenerateEmbeddings(); // no accountId → all accounts
-        } catch (err) {
-          addLog('error', 'ai', t('settings:ai.reindexFailed', { error: errorText(err) }));
-        }
-      }
-
-      setSuccess(embedChanged ? t('settings:ai.saveSuccessReindex') : t('settings:ai.saveSuccess'));
+      setSuccess(
+        build && config.embeddingModel.trim() ? t('settings:ai.saveSuccessReindex') : t('settings:ai.saveSuccess'),
+      );
       addLog('success', 'ai', t('settings:ai.backendSet', { provider: config.provider, model: config.model }));
       if (apiKey) setApiKey('');
       void loadAll();
@@ -751,6 +800,16 @@ export function AiSettings() {
           <div className="p-3 bg-green-50 border border-green-200 rounded text-green-700 text-sm">{success}</div>
         )}
 
+        <EmbeddingLifecycle
+          policy={dimensionPolicy}
+          onPolicy={setDimensionPolicy}
+          onBuild={() => {
+            forceEmbeddingBuildRef.current = true;
+            handleSave();
+          }}
+          busy={saving}
+        />
+
         {/* ── Master AI toggle ────────────────────────────────────────────── */}
         <section className="p-4 rounded-lg border border-gray-200 bg-gray-50">
           <div className="flex items-center justify-between gap-4">
@@ -857,7 +916,16 @@ export function AiSettings() {
               <ServerPanel
                 config={config}
                 server={config.server}
-                setConfig={setConfig}
+                setConfig={(next) => {
+                  if (
+                    next.server?.embeddingSource === 'server' &&
+                    (next.embeddingModel !== config.embeddingModel ||
+                      next.server.baseUrl !== config.server?.baseUrl ||
+                      config.server?.embeddingSource !== 'server')
+                  )
+                    setDimensionPolicy('Native');
+                  setConfig(next);
+                }}
                 apiKey={serverApiKey}
                 setApiKey={setServerApiKey}
                 clearApiKey={clearServerKey}
@@ -904,28 +972,42 @@ export function AiSettings() {
         <AiWorkInProgressDialog
           change={workInProgress.change}
           activity={workInProgress.activity}
-          onCancel={() => setWorkInProgress(null)}
+          onCancel={() => {
+            forceEmbeddingBuildRef.current = false;
+            setWorkInProgress(null);
+          }}
           onProceed={() => {
             setWorkInProgress(null);
             confirmReindexOrSave();
           }}
         />
       )}
-      {confirmReindex && (
-        <ConfirmReindexDialog
-          embeddingModel={config.embeddingModel}
-          sendsToOpenRouter={sendsIndexToOpenRouter(config.provider, config.server?.embeddingSource)}
-          onCancel={() => setConfirmReindex(false)}
-          onConfirm={() => {
-            setConfirmReindex(false);
-            void save();
+      {confirmEmbeddingOptOut && (
+        <ConfirmEmbeddingOptOutDialog
+          onDecide={(yes) => {
+            setConfirmEmbeddingOptOut(false);
+            buildDecisionRef.current?.(yes);
+            buildDecisionRef.current = null;
+          }}
+        />
+      )}
+      {buildPreview && (
+        <ConfirmEmbeddingBuildDialog
+          preview={buildPreview}
+          onDecide={(yes) => {
+            setBuildPreview(null);
+            buildDecisionRef.current?.(yes);
+            buildDecisionRef.current = null;
           }}
         />
       )}
       {disclosure && (
         <ServerDisclosureDialog
           host={disclosure}
-          onCancel={() => setDisclosure(null)}
+          onCancel={() => {
+            forceEmbeddingBuildRef.current = false;
+            setDisclosure(null);
+          }}
           onConfirm={() => {
             acceptedHostRef.current = disclosure;
             setDisclosure(null);

@@ -200,7 +200,7 @@ fn finish_model_op(
             // silently; auto-select would otherwise look like it succeeded
             // while the next launch re-prompts.
             let save = |key: &str, value: &str| {
-                if let Err(e) = db.set_preference(key, value) {
+                if let Err(e) = crate::services::ai::AiService::set_legacy_ai_preference(db, key, value) {
                     emit_log(app, "error", &format!("failed to persist preference {key}: {e}"));
                 }
             };

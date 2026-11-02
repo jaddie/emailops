@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
 use crate::models::error::Result;
-use crate::services::ai::AiService;
 use crate::services::task_queue;
 
 pub(crate) const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
@@ -341,15 +340,20 @@ pub async fn regenerate_embeddings(
         emit_cancelled(0, 0, "Search index rebuild stopped before it started");
         return Ok(0);
     }
-    let profile = match db.active_embedding_write_lease()? {
-        Some(active) => db.embedding_generation_profile(active.generation_id)?,
-        None => AiService::embedding_profile_candidate(
-            db,
-            crate::db::embedding_generations::DimensionPolicy::Explicit(768),
-        )?,
-    };
-    let preview =
-        super::embedding_runtime::preview_build(db, &profile, &crate::db::embedding_generations::Corpus::ALL).await?;
+    let active = db.active_embedding_write_lease()?.ok_or_else(|| {
+        crate::models::error::AppError::InvalidInput(
+            "Build and verify the initial embedding index in AI Settings before requesting an account rebuild".into(),
+        )
+    })?;
+    let profile = db.embedding_generation_profile(active.generation_id)?;
+    let mut corpora = vec![crate::db::embedding_generations::Corpus::Emails];
+    if db.is_memory_enabled()? {
+        corpora.push(crate::db::embedding_generations::Corpus::MemoryFacts);
+    }
+    if db.is_help_docs_enabled()? {
+        corpora.push(crate::db::embedding_generations::Corpus::HelpDocs);
+    }
+    let preview = super::embedding_runtime::preview_build(db, &profile, &corpora).await?;
     let lease = super::embedding_runtime::commit_build(db, &preview).await?;
     super::embedding_runtime::run_build_scoped(db, &lease, account_id).await
 }

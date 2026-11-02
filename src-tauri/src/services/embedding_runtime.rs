@@ -32,8 +32,14 @@ fn check_format(profile: &EmbeddingProfile) -> Result<()> {
 /// A backend preview is fenced against every embedding-settings writer. This
 /// object contains no credential. Commit re-probes before creating any tables.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddingBuildPreview {
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub expected_revision: i64,
     pub profile: EmbeddingProfile,
     pub enabled_corpora: Vec<Corpus>,
@@ -285,6 +291,122 @@ pub async fn run_build(db: &Arc<Database>, lease: &BuildLease) -> Result<u32> {
     run_build_scoped(db, lease, None).await
 }
 
+/// Own the durable lease from submission through queue pickup. Queued work is
+/// not inference: restart never re-enqueues it, and cancellation pauses it.
+pub async fn enqueue_build(db: Arc<Database>, queue: &task_queue::TaskQueue, lease: BuildLease) -> Result<()> {
+    enqueue_build_with(
+        db,
+        queue,
+        lease,
+        Arc::new(super::clock::SystemClock),
+        |db, lease| async move { run_build(&db, &lease).await },
+    )
+    .await
+}
+
+struct QueuedBuildGuard {
+    db: Arc<Database>,
+    lease: BuildLease,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl QueuedBuildGuard {
+    fn start(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+impl Drop for QueuedBuildGuard {
+    fn drop(&mut self) {
+        self.start();
+        if let Err(error) = self.db.finish_embedding_build_if_owned(
+            &self.lease,
+            false,
+            "Embedding queue ownership ended; explicit resume required",
+        ) {
+            super::logger::log(
+                "warn",
+                "embeddings",
+                format!("Could not pause abandoned embedding queue owner: {error}"),
+            );
+        }
+    }
+}
+
+async fn enqueue_build_with<F, Fut>(
+    db: Arc<Database>,
+    queue: &task_queue::TaskQueue,
+    lease: BuildLease,
+    clock: Arc<dyn super::clock::Clock>,
+    run: F,
+) -> Result<()>
+where
+    F: FnOnce(Arc<Database>, BuildLease) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<u32>> + Send + 'static,
+{
+    db.heartbeat_embedding_generation_at(&lease, clock.now_secs())?;
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let info: Arc<std::sync::Mutex<Option<task_queue::TaskInfo>>> = Arc::new(std::sync::Mutex::new(None));
+    let monitor_info = info.clone();
+    let monitor_db = db.clone();
+    let monitor_lease = lease.clone();
+    tokio::spawn(async move {
+        let mut cancel = tokio::time::interval(Duration::from_millis(200));
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        cancel.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _=&mut stopped=>break,
+                _=cancel.tick()=>{
+                    let cancelled=monitor_info.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(|task|task.cancel_requested());
+                    if cancelled {
+                        if let Err(error)=monitor_db.finish_embedding_build_if_owned(&monitor_lease,false,"Embedding build cancelled while queued; explicit resume required") {super::logger::log("warn","embeddings",format!("Could not pause cancelled queue owner: {error}"));}
+                        break;
+                    }
+                },
+                _=heartbeat.tick()=>{
+                    if let Err(error)=monitor_db.heartbeat_embedding_generation_at(&monitor_lease,clock.now_secs()) {
+                        super::logger::log("debug","embeddings",format!("Queued embedding worker fenced: {error}"));
+                        if let Err(error)=monitor_db.finish_embedding_build_if_owned(&monitor_lease,false,"Embedding queue lease interrupted; explicit resume required") {super::logger::log("warn","embeddings",format!("Could not pause interrupted queue owner: {error}"));}
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut guard = QueuedBuildGuard {
+        db: db.clone(),
+        lease: lease.clone(),
+        stop: Some(stop),
+    };
+    let name = format!("embeddings:rebuild:g{}:e{}", lease.generation_id, lease.epoch);
+    let task = queue
+        .try_submit_named(&name, async move {
+            guard.start();
+            if task_queue::cancel_requested() {
+                return;
+            }
+            // A stopped old queue entry must not send requests or alter a resumed epoch.
+            if let Err(error) = db.embedding_build_is_current(&lease) {
+                super::logger::log(
+                    "debug",
+                    "embeddings",
+                    format!("Queued build no longer owns its generation: {error}"),
+                );
+                return;
+            }
+            if let Err(error) = run(db, lease).await {
+                super::logger::log("warn", "embeddings", format!("Embedding index build stopped: {error}"));
+            }
+        })
+        .await?;
+    *info.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+    Ok(())
+}
+
 /// A same-profile account rebuild can copy verified current sources outside
 /// that account's email corpus. Profile changes always infer every source.
 pub async fn run_build_scoped(db: &Arc<Database>, lease: &BuildLease, rebuild_account: Option<&str>) -> Result<u32> {
@@ -301,14 +423,14 @@ pub async fn run_build_scoped(db: &Arc<Database>, lease: &BuildLease, rebuild_ac
         let paused =
             task_queue::cancel_requested() || db.embedding_generation_status(lease.generation_id)?.state == "paused";
         // Persist a stable non-sensitive status; provider bodies never enter DB.
-        if let Err(error) = db.stop_embedding_generation(
-            lease.generation_id,
+        if let Err(error) = db.finish_embedding_build_if_owned(
+            lease,
             !paused,
-            Some(if paused {
+            if paused {
                 "Stopped by user"
             } else {
                 "Embedding build failed; verify provider and resume"
-            }),
+            },
         ) {
             super::logger::log("debug", "embeddings", format!("Build already fenced: {error}"));
         }
@@ -780,5 +902,157 @@ mod tests {
                 .unwrap()
                 .get("dimensions")
                 .is_none()));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn queued_lease_survives_more_than_its_original_deadline_without_inference() {
+        use crate::services::clock::{Clock, FixedClock};
+        let db = fixture();
+        let profile = profile(768);
+        let lease = db
+            .prepare_embedding_generation(
+                &profile,
+                &[Corpus::Emails],
+                db.embedding_generation_control().unwrap().revision,
+            )
+            .unwrap();
+        let clock = Arc::new(FixedClock::new(chrono::Utc::now().timestamp()));
+        assert!(
+            db.heartbeat_embedding_generation_at(&lease, clock.now_secs() + 61)
+                .is_err(),
+            "the original un-heartbeated queue lease expires after60s"
+        );
+        let queue = task_queue::TaskQueue::new(1, "embedding_queue_test");
+        let (release, blocked) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        queue
+            .submit_named("blocker", async move {
+                let _ = started_tx.send(());
+                let _ = blocked.await;
+            })
+            .await;
+        started.await.unwrap();
+        let (ran_tx, ran) = tokio::sync::oneshot::channel();
+        let run_clock = clock.clone();
+        enqueue_build_with(
+            db.clone(),
+            &queue,
+            lease.clone(),
+            clock.clone(),
+            move |db, lease| async move {
+                let current = db
+                    .heartbeat_embedding_generation_at(&lease, run_clock.now_secs())
+                    .is_ok();
+                let _ = ran_tx.send(current);
+                Ok(0)
+            },
+        )
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        for _ in 0..8 {
+            clock.advance_secs(10);
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            db.embedding_generation_status(lease.generation_id).unwrap().state,
+            "building"
+        );
+        let deadline: i64 = db
+            .reader()
+            .query_row(
+                "SELECT lease_until FROM embedding_generations WHERE id=?1",
+                [lease.generation_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(deadline > clock.now_secs());
+        release.send(()).unwrap();
+        assert!(
+            ran.await.unwrap(),
+            "ownership is valid after80s of queued waiting without loading a provider"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_queue_entry_cannot_start_or_stop_a_resumed_epoch() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let db = fixture();
+        let profile = profile(768);
+        let lease = db
+            .prepare_embedding_generation(
+                &profile,
+                &[Corpus::Emails],
+                db.embedding_generation_control().unwrap().revision,
+            )
+            .unwrap();
+        let queue = task_queue::TaskQueue::new(1, "embedding_queue_cancel_test");
+        let (release, blocked) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        queue
+            .submit_named("blocker", async move {
+                let _ = started_tx.send(());
+                let _ = blocked.await;
+            })
+            .await;
+        started.await.unwrap();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_in_run = calls.clone();
+        enqueue_build_with(
+            db.clone(),
+            &queue,
+            lease.clone(),
+            Arc::new(super::super::clock::SystemClock),
+            move |_, _| async move {
+                calls_in_run.fetch_add(1, Ordering::Relaxed);
+                Ok(0)
+            },
+        )
+        .await
+        .unwrap();
+        queue.cancel_matching(|name| name.starts_with("embeddings:rebuild:"));
+        tokio::time::advance(Duration::from_millis(400)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            db.embedding_generation_status(lease.generation_id).unwrap().state,
+            "paused"
+        );
+        let resumed = db
+            .resume_embedding_generation(
+                lease.generation_id,
+                &lease.fingerprint,
+                db.embedding_generation_control().unwrap().revision,
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        db.embedding_build_is_current(&resumed).unwrap();
+        assert_eq!(
+            db.embedding_generation_status(resumed.generation_id).unwrap().state,
+            "building"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_enqueue_pauses_only_its_owned_generation() {
+        let db = fixture();
+        let profile = profile(768);
+        let lease = db
+            .prepare_embedding_generation(
+                &profile,
+                &[Corpus::Emails],
+                db.embedding_generation_control().unwrap().revision,
+            )
+            .unwrap();
+        let queue = task_queue::TaskQueue::new(1, "embedding_queue_failed_test");
+        queue.close_for_testing().await;
+        assert!(enqueue_build(db.clone(), &queue, lease.clone()).await.is_err());
+        assert_eq!(
+            db.embedding_generation_status(lease.generation_id).unwrap().state,
+            "paused"
+        );
     }
 }

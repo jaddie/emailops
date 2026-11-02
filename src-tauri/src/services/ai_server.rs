@@ -91,6 +91,11 @@ pub fn plan_context_report(configured: u32, served: Option<u32>) -> ContextRepor
 
 /// Where the email index is computed when chat runs on the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
 #[serde(rename_all = "lowercase")]
 pub enum EmbeddingSource {
     /// The same server: mail goes to one destination only.
@@ -122,6 +127,11 @@ impl EmbeddingSource {
 
 /// What Settings sends for the server when it is saved.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSettingsInput {
     pub base_url: String,
@@ -234,6 +244,7 @@ pub fn plan_server_settings(
 }
 
 /// Write `plan`'s preferences (the key is written by [`apply_key_change`]).
+#[cfg(any(test, feature = "eval"))]
 pub(crate) fn store_server_settings(db: &Database, plan: &ServerSettingsPlan) -> Result<()> {
     db.set_preference(BASE_URL_PREF, &plan.base_url)?;
     db.set_preference(EMBEDDING_SOURCE_PREF, plan.embedding_source.as_pref())?;
@@ -307,6 +318,7 @@ pub fn load_api_key(db: &Database) -> Result<String> {
 
 /// Apply `change` to the stored key: in the secrets vault, or in a preference
 /// on debug builds (`dev`).
+#[cfg(test)]
 pub(crate) fn apply_key_change(db: &Database, change: &KeyChange, dev: bool) -> Result<()> {
     match change {
         KeyChange::Keep => {}

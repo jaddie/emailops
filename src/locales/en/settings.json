@@ -208,7 +208,7 @@
     "embeddingRecommendedEnglish": "recommended, English only",
     "embeddingNotice": "With an Embeddings model selected, the text of every email that gets indexed, and of every search and chat question, is sent to OpenRouter and counts against the monthly budget. With none selected, semantic search is off and search is keyword-only.",
     "embeddingNeedsKey": "Save your API key to load the list of Embeddings models.",
-    "embeddingNeedsCheck": "Saving checks that this model produces the 768-dimension vectors the email index needs.",
+    "embeddingNeedsCheck": "Saving probes the selected model and dimension policy before creating a replacement index.",
     "embeddingCheckFailed": "Nothing was saved — the Embeddings model cannot be used: {{error}}",
     "embeddingZdrBlocked": "Nothing was saved — no provider for the Embeddings model {{model}} meets the zero-data-retention setting. Turn off “Zero data retention only” in Settings → AI → OpenRouter, or use no Embeddings model (keyword-only search).",
     "embeddingListFailed": "Failed to load the OpenRouter Embeddings models: {{error}}"
@@ -250,14 +250,6 @@
     "disclosureRetention": "EmailOps cannot control whether that server, or a service behind it, keeps this content or trains models on it. Only continue if you trust the server.",
     "disclosureLocalHint": "To keep mail on a network you control, reach the server through an SSH tunnel or Tailscale and use http://localhost.",
     "disclosureConfirm": "Send to this server"
-  },
-  "confirmReindex": {
-    "title": "Regenerate all Embeddings?",
-    "body": "The Embeddings model changed. Saving deletes all existing Embeddings and regenerates them with the new model. Semantic search is reduced until that finishes.",
-    "bodyNone": "No Embeddings model is selected. Saving deletes all existing Embeddings and turns semantic search off: search is keyword-only until you choose a model.",
-    "openRouter": "The text of every indexed email will be sent to OpenRouter and billed to your OpenRouter account.",
-    "confirm": "Save and regenerate",
-    "confirmNone": "Save and delete"
   },
   "aiWork": {
     "title": "AI work in progress",
@@ -746,5 +738,47 @@
     "website": "Website",
     "sourceCode": "Source code on GitHub",
     "sponsor": "Sponsor the project ♥"
+  },
+  "embeddingLifecycle": {
+    "title": "Embedding index",
+    "warning": "Changes build a replacement alongside the active index and may send data to the selected provider. Legacy indexes remain unverified; text search is used until a verified build completes.",
+    "identity": "Model revisions may be unavailable; the observed identity cannot guarantee that a server has not changed its model.",
+    "active": "Active",
+    "pending": "Pending",
+    "retained": "Retained",
+    "legacy": "Unverified legacy index",
+    "noRevision": "Server revision unavailable",
+    "failed": "Failed",
+    "disabled": "(disabled)",
+    "dimensions": "Dimensions",
+    "native": "Native (detect)",
+    "explicit": "Explicit",
+    "preview": "Preview and build",
+    "stop": "Stop",
+    "resume": "Resume / retry",
+    "discard": "Discard",
+    "rollback": "Rollback",
+    "Emails": "Emails",
+    "MemoryFacts": "Memory",
+    "HelpDocs": "Help documents",
+    "confirm": "Build and activate {{model}} with {{dimensions}} detected dimensions? Any verified active index remains available during the build.",
+    "requested": "Requested",
+    "detected": "Detected",
+    "activate": "Build and activate",
+    "state": {
+      "active": "Active",
+      "retained": "Retained",
+      "legacy_unverified": "Legacy, unverified",
+      "preparing": "Preparing",
+      "building": "Building",
+      "validating": "Validating",
+      "paused": "Paused",
+      "failed": "Failed",
+      "interrupted": "Interrupted",
+      "repair": "Repair required"
+    },
+    "disableTitle": "Disable embeddings",
+    "disableWarning": "Semantic retrieval will use text search. Existing indexes are preserved and any pending build is stopped.",
+    "disable": "Disable embeddings"
   }
 }

@@ -21,6 +21,11 @@ pub use runtime::{
 const LEASE_SECONDS: i64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
 pub enum DimensionPolicy {
     Native,
     Explicit(usize),
@@ -30,6 +35,11 @@ pub enum DimensionPolicy {
 /// the exact query/document transformation changes. A model name is not proof of
 /// revision identity; `model_revision == None` remains visibly opaque to callers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
 pub struct EmbeddingProfile {
     pub version: u32,
     pub backend: String,
@@ -105,6 +115,11 @@ pub fn input_hash(input: &[u8]) -> String {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
 pub enum Corpus {
     Emails,
     MemoryFacts,
@@ -164,13 +179,22 @@ pub struct GenerationControl {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
 pub struct GenerationStatus {
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub id: i64,
     pub fingerprint: Option<String>,
     pub dimensions: usize,
     pub state: String,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub epoch: i64,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub completed: i64,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub failed: i64,
     pub error: Option<String>,
     pub validation: Option<String>,
@@ -215,13 +239,23 @@ fn carry_active_scope(conn: &Connection, previous_revision: i64) -> Result<()> {
 }
 
 fn check_lease(conn: &Connection, lease: &BuildLease) -> Result<usize> {
+    check_lease_at(conn, lease, now())
+}
+
+fn check_lease_at(conn: &Connection, lease: &BuildLease, timestamp: i64) -> Result<usize> {
     let dimensions: Option<usize> = conn
         .query_row(
             "SELECT g.dimensions FROM embedding_generations g
              JOIN embedding_control c ON c.pending_id=g.id
              WHERE g.id=?1 AND g.epoch=?2 AND g.owner=?3 AND g.fingerprint=?4
                AND g.lease_until>?5 AND g.config_revision=c.revision AND g.state IN ('building','validating')",
-            params![lease.generation_id, lease.epoch, lease.owner, lease.fingerprint, now()],
+            params![
+                lease.generation_id,
+                lease.epoch,
+                lease.owner,
+                lease.fingerprint,
+                timestamp
+            ],
             |r| r.get::<_, i64>(0).map(|n| n as usize),
         )
         .optional()?;
@@ -592,12 +626,16 @@ impl Database {
     }
 
     pub fn heartbeat_embedding_generation(&self, lease: &BuildLease) -> Result<()> {
+        self.heartbeat_embedding_generation_at(lease, now())
+    }
+
+    pub(crate) fn heartbeat_embedding_generation_at(&self, lease: &BuildLease, timestamp: i64) -> Result<()> {
         let mut conn = self.connection();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_lease(&tx, lease)?;
+        check_lease_at(&tx, lease, timestamp)?;
         tx.execute(
             "UPDATE embedding_generations SET lease_until=?2 WHERE id=?1",
-            params![lease.generation_id, now() + LEASE_SECONDS],
+            params![lease.generation_id, timestamp + LEASE_SECONDS],
         )?;
         tx.commit()?;
         Ok(())
