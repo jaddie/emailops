@@ -147,7 +147,30 @@ pub struct PreparedAiSettings {
     server: Option<ServerSettingsPlan>,
     /// The server embedding model that just passed the probe, as stored in the
     /// validated preference, and how to ask it for vectors.
-    server_embedding: Option<(String, EmbeddingDimensions)>,
+    server_embedding: Option<(String, EmbeddingDimensions, usize)>,
+}
+
+/// A proposed settings/index operation. Secrets are private and intentionally
+/// have no Debug/Serialize representation. Staging creates unreachable versioned
+/// vault entries; only the caller's SQLite transaction publishes their references.
+pub struct PreparedEmbeddingSettings {
+    pub profile: crate::db::embedding_generations::EmbeddingProfile,
+    pub(crate) preference_writes: Vec<(String, Option<String>)>,
+    server_key: Option<ai_server::KeyChange>,
+    openrouter_key: Option<String>,
+}
+
+impl PreparedEmbeddingSettings {
+    pub(crate) fn stage_credentials(&self, db: &Database) -> Result<Vec<(String, Option<String>)>> {
+        let mut writes = Vec::new();
+        if let Some(change) = &self.server_key {
+            writes.extend(ai_server::stage_key_change(db, change, AiService::use_dev_ai_keys())?);
+        }
+        if let Some(key) = &self.openrouter_key {
+            writes.extend(AiService::stage_openrouter_api_key(key)?);
+        }
+        Ok(writes)
+    }
 }
 
 /// The value of the validated-model preference for a server embedding model:
@@ -407,6 +430,473 @@ fn format_ollama_keep_alive(secs: u32) -> String {
 }
 
 impl AiService {
+    /// Proposed profile only: Native has no observed dimensions until probing.
+    pub fn embedding_profile_candidate(
+        db: &Database,
+        policy: crate::db::embedding_generations::DimensionPolicy,
+    ) -> Result<crate::db::embedding_generations::EmbeddingProfile> {
+        use crate::db::embedding_generations::{DimensionPolicy, EmbeddingProfile};
+        let config = Self::get_config(db)?;
+        let backend = Self::embedding_provider(db)?;
+        let endpoint = match backend.as_str() {
+            "openrouter" => Some("https://openrouter.ai/api/v1".into()),
+            ai_server::PROVIDER_ID => ai_server::load_server_settings(db)?.base_url,
+            "ollama" => Some(OllamaClient::configured_base_url()?),
+            "llamacpp" => None,
+            _ => return Err(AppError::InvalidInput("Unknown embedding backend".into())),
+        };
+        let dimensions = match policy {
+            DimensionPolicy::Native => 0,
+            DimensionPolicy::Explicit(n) => n,
+        };
+        Ok(EmbeddingProfile {
+            version: 1,
+            backend,
+            endpoint,
+            model: config.embedding_model,
+            model_revision: None,
+            dimension_policy: policy,
+            dimensions,
+            query_format: "raw-query-v1".into(),
+            document_format: "emailops-documents-v1".into(),
+            preprocessing: "emailops-chunk-v1".into(),
+            normalization: "none".into(),
+            encoding: "float32-le".into(),
+            distance_metric: "cosine".into(),
+        })
+    }
+
+    pub async fn probe_embedding_profile(
+        db: Arc<Database>,
+        candidate: impl std::borrow::Borrow<crate::db::embedding_generations::EmbeddingProfile>,
+    ) -> Result<crate::db::embedding_generations::EmbeddingProfile> {
+        use crate::db::embedding_generations::DimensionPolicy;
+        let mut profile = candidate.borrow().clone();
+        // Canonicalize identity before any I/O, using a temporary valid Native
+        // size only for validation. An unobserved size is never fingerprinted.
+        if profile.dimension_policy == DimensionPolicy::Native && profile.dimensions == 0 {
+            profile.dimensions = 1;
+        }
+        profile = profile.canonicalized()?;
+        Self::authorize_embedding(&db, &profile, crate::db::embedding_generations::Corpus::Emails)?;
+        let result = Self::embed_profile_request(&db, &profile, super::embedding_session::CANARY_TEXT, true).await?;
+        profile.dimensions = result.embedding.len();
+        // A NEW opaque candidate receives a clearly labelled observation
+        // discriminator. Re-probing a saved identity never replaces it, so old
+        // query/resume/rollback paths cannot silently adopt different weights.
+        // Compatible active/pending observations reuse their token with a cosine
+        // tolerance, rather than hashing numerically variable float bytes.
+        if profile.model_revision.is_none() {
+            profile.model_revision = Some(super::embedding_session::opaque_probe_revision(
+                &db,
+                &profile,
+                &result.embedding,
+            )?);
+            profile = profile.canonicalized()?;
+            super::embedding_session::remember_canary(&db, &profile, &result.embedding)?;
+        } else {
+            profile = profile.canonicalized()?;
+            super::embedding_session::verify_canary(&db, &profile, &result.embedding)?;
+        }
+        Ok(profile)
+    }
+
+    /// Prepare a composed settings + generation transaction without applying
+    /// mutable settings. Only fixed neutral text reaches the proposed endpoint.
+    pub async fn prepare_embedding_settings(
+        db: &Database,
+        input: AiSettingsInput,
+        policy: crate::db::embedding_generations::DimensionPolicy,
+        expected_profile: Option<&crate::db::embedding_generations::EmbeddingProfile>,
+    ) -> Result<PreparedEmbeddingSettings> {
+        use crate::db::embedding_generations::{DimensionPolicy, EmbeddingProfile};
+        if !db.is_ai_enabled()? {
+            return Err(AppError::AiDisabled);
+        }
+        let prepared = Self::prepare_ai_settings_inner(db, input, Some(policy.clone()), false).await?;
+        let input = prepared.input;
+        let source = prepared
+            .server
+            .as_ref()
+            .map(|server| server.embedding_source)
+            .unwrap_or_default();
+        let backend = embedding_backend(&input.provider, source).to_string();
+        let current_embedding = db.get_preference("ai_embedding_model")?;
+        let model_plan = plan_embedding_model(
+            &backend,
+            input.embedding_model.as_deref(),
+            current_embedding.as_deref(),
+            Self::stored_embedding_model(db, &input.provider)?.as_deref(),
+            Self::stored_embedding_model(db, "openrouter")?.as_deref(),
+        );
+        if model_plan.model.is_empty() || model_plan.corrected_from.is_some() {
+            return Err(AppError::InvalidInput(
+                "Choose an embedding model supported by the proposed provider before building an index".into(),
+            ));
+        }
+        let endpoint = match backend.as_str() {
+            "openrouter" => Some("https://openrouter.ai/api/v1".into()),
+            ai_server::PROVIDER_ID => prepared.server.as_ref().map(|plan| plan.base_url.clone()),
+            "ollama" => Some(OllamaClient::configured_base_url()?),
+            "llamacpp" => None,
+            _ => return Err(AppError::InvalidInput("Unknown embedding backend".into())),
+        };
+        let mut profile = EmbeddingProfile {
+            version: 1,
+            backend: backend.clone(),
+            endpoint,
+            model: model_plan.model.clone(),
+            model_revision: expected_profile.and_then(|expected| expected.model_revision.clone()),
+            dimension_policy: policy.clone(),
+            dimensions: match policy {
+                DimensionPolicy::Native => 1,
+                DimensionPolicy::Explicit(n) => n,
+            },
+            query_format: "raw-query-v1".into(),
+            document_format: "emailops-documents-v1".into(),
+            preprocessing: "emailops-chunk-v1".into(),
+            normalization: "none".into(),
+            encoding: "float32-le".into(),
+            distance_metric: "cosine".into(),
+        }
+        .canonicalized()?;
+        let openrouter_key = input
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string);
+        let result = match backend.as_str() {
+            ai_server::PROVIDER_ID => {
+                let plan = prepared
+                    .server
+                    .as_ref()
+                    .ok_or_else(|| AppError::InvalidInput("Missing proposed server settings".into()))?;
+                let key = match &plan.key {
+                    ai_server::KeyChange::Set(key) => key.clone(),
+                    ai_server::KeyChange::Clear => String::new(),
+                    ai_server::KeyChange::Keep => ai_server::load_api_key(db)?,
+                };
+                OpenRouterClient::openai_compatible(&plan.base_url, key, String::new(), profile.model.clone())
+                    .embed_profile(super::embedding_session::CANARY_TEXT, &policy, None)
+                    .await?
+            }
+            "openrouter" => {
+                Self::ensure_budget(db, ProviderType::OpenRouter)?;
+                let key = match &openrouter_key {
+                    Some(key) => key.clone(),
+                    None => Self::load_openrouter_api_key(db)?,
+                };
+                OpenRouterClient::new(key, String::new(), profile.model.clone())
+                    .with_zero_data_retention(
+                        input
+                            .zero_data_retention
+                            .unwrap_or(Self::get_config(db)?.zero_data_retention),
+                    )
+                    .embed_profile(super::embedding_session::CANARY_TEXT, &policy, None)
+                    .await?
+            }
+            "ollama" => {
+                OllamaClient::new_with_models(None, Some(&profile.model))
+                    .with_embedding_endpoint(
+                        profile
+                            .endpoint
+                            .as_deref()
+                            .ok_or_else(|| AppError::InvalidInput("Missing Ollama endpoint".into()))?,
+                    )?
+                    .embed(super::embedding_session::CANARY_TEXT)
+                    .await?
+            }
+            "llamacpp" => {
+                Self::in_app_embedder(db, &profile.model)?
+                    .embed(super::embedding_session::CANARY_TEXT)
+                    .await?
+            }
+            _ => return Err(AppError::InvalidInput("Unknown embedding backend".into())),
+        };
+        crate::ai::openrouter::validate_embedding_vector(
+            &result.embedding,
+            match policy {
+                DimensionPolicy::Native => None,
+                DimensionPolicy::Explicit(n) => Some(n),
+            },
+        )?;
+        if result.cost_usd > 0.0 {
+            Self::record_provider_call(
+                db,
+                ProviderType::OpenRouter,
+                &profile.model,
+                "embed",
+                result.tokens,
+                0,
+                result.cost_usd,
+            )?;
+        }
+        profile.dimensions = result.embedding.len();
+        if let Some(expected) = expected_profile {
+            if profile.canonicalized()? != expected.canonicalized()? {
+                return Err(AppError::InvalidInput(
+                    "Proposed embedding settings changed since preview; probe a new preview before committing".into(),
+                ));
+            }
+            super::embedding_session::verify_canary(db, &profile, &result.embedding)?;
+        } else {
+            profile.model_revision = Some(super::embedding_session::opaque_probe_revision(
+                db,
+                &profile,
+                &result.embedding,
+            )?);
+            super::embedding_session::remember_canary(db, &profile, &result.embedding)?;
+        }
+        let mut writes = vec![
+            ("ai_provider".into(), Some(input.provider.clone())),
+            ("ai_model".into(), Some(input.model.clone())),
+            ("ai_embedding_model".into(), Some(profile.model.clone())),
+            (remembered_model_pref(&input.provider), Some(input.model.clone())),
+            (remembered_embedding_pref(&input.provider), Some(profile.model.clone())),
+            ("ai_monthly_budget".into(), Some(input.monthly_budget_usd.to_string())),
+            (
+                "ai_period_start".into(),
+                Some(chrono::Utc::now().timestamp().to_string()),
+            ),
+        ];
+        if let Some(thinking) = input.thinking_enabled {
+            writes.push(("ai_thinking_enabled".into(), Some(thinking.to_string())));
+        }
+        if let Some(zdr) = input.zero_data_retention {
+            writes.push((OPENROUTER_ZDR_PREF.into(), Some(zdr.to_string())));
+        }
+        if let Some(previous) = db
+            .get_preference("ai_provider")?
+            .filter(|previous| previous != &input.provider)
+        {
+            if let Some(model) = db.get_preference("ai_model")? {
+                writes.push((remembered_model_pref(&previous), Some(model)));
+            }
+            if let Some(model) = current_embedding {
+                writes.push((remembered_embedding_pref(&previous), Some(model)));
+            }
+        }
+        if let Some(plan) = &prepared.server {
+            writes.extend(ai_server::server_preference_writes(plan));
+        }
+        let mode = match policy {
+            DimensionPolicy::Native => EmbeddingDimensions::Native,
+            DimensionPolicy::Explicit(n) if n == crate::db::embeddings::EMAIL_EMBEDDING_DIM => {
+                EmbeddingDimensions::Requested
+            }
+            DimensionPolicy::Explicit(n) => EmbeddingDimensions::Explicit(n),
+        };
+        if backend == ai_server::PROVIDER_ID {
+            let endpoint = profile
+                .endpoint
+                .as_deref()
+                .ok_or_else(|| AppError::InvalidInput("Missing embedding endpoint".into()))?;
+            writes.extend([
+                (
+                    ai_server::EMBED_VALIDATED_PREF.into(),
+                    Some(server_embedding_key(endpoint, &profile.model)),
+                ),
+                (ai_server::EMBED_DIMENSIONS_PREF.into(), Some(mode.as_pref())),
+                (
+                    "openai_compatible_embedding_actual_dimensions".into(),
+                    Some(profile.dimensions.to_string()),
+                ),
+            ]);
+        } else if backend == "openrouter" {
+            writes.extend([
+                (OPENROUTER_EMBED_VALIDATED_PREF.into(), Some(profile.model.clone())),
+                (OPENROUTER_EMBED_DIMENSIONS_PREF.into(), Some(mode.as_pref())),
+                (
+                    "openrouter_embedding_actual_dimensions".into(),
+                    Some(profile.dimensions.to_string()),
+                ),
+            ]);
+        }
+        Ok(PreparedEmbeddingSettings {
+            profile,
+            preference_writes: writes,
+            server_key: prepared.server.map(|server| server.key),
+            openrouter_key: if backend == "openrouter" { openrouter_key } else { None },
+        })
+    }
+
+    pub async fn embedding_session(
+        db: Arc<Database>,
+        profile: &crate::db::embedding_generations::EmbeddingProfile,
+    ) -> Result<super::embedding_session::EmbeddingSession> {
+        let session = super::embedding_session::EmbeddingSession::new(db, profile.clone())?;
+        session.verify_identity().await?;
+        Ok(session)
+    }
+
+    /// Every caller, including long-lived sessions, passes this immediately
+    /// before inference. Corpus-specific switches are never frozen in profiles.
+    pub(crate) fn authorize_embedding(
+        db: &Database,
+        profile: &crate::db::embedding_generations::EmbeddingProfile,
+        corpus: crate::db::embedding_generations::Corpus,
+    ) -> Result<()> {
+        use crate::db::embedding_generations::Corpus;
+        if !db.is_ai_enabled()? {
+            return Err(AppError::AiDisabled);
+        }
+        if match corpus {
+            Corpus::Emails => false,
+            Corpus::MemoryFacts => !db.is_memory_enabled()?,
+            Corpus::HelpDocs => !db.is_help_docs_enabled()?,
+        } {
+            return Err(AppError::InvalidInput(
+                "Embedding processing is disabled for this feature".into(),
+            ));
+        }
+        let remote = profile
+            .endpoint
+            .as_deref()
+            .and_then(ai_base_url_host)
+            .is_some_and(|(_, local)| !local);
+        if remote {
+            if Self::embedding_provider(db)? != profile.backend {
+                return Err(AppError::InvalidInput("This remote embedding destination is no longer selected. Review the provider and embedding source before continuing.".into()));
+            }
+            if profile.backend == ai_server::PROVIDER_ID {
+                let server = ai_server::load_server_settings(db)?;
+                let (host, _) = profile
+                    .endpoint
+                    .as_deref()
+                    .and_then(ai_base_url_host)
+                    .ok_or_else(|| AppError::InvalidInput("Invalid embedding endpoint".into()))?;
+                if !server
+                    .disclosed_host
+                    .as_deref()
+                    .is_some_and(|saved| saved.eq_ignore_ascii_case(&host))
+                {
+                    return Err(AppError::InvalidInput(format!(
+                        "Confirm that embedding content may be sent to {host} before continuing"
+                    )));
+                }
+            }
+            if profile.backend == "ollama"
+                && profile.endpoint.as_deref() != Some(OllamaClient::configured_base_url()?.as_str())
+            {
+                return Err(AppError::InvalidInput(
+                    "The selected Ollama destination changed; review this embedding profile before continuing.".into(),
+                ));
+            }
+        }
+        if profile.backend == "openrouter" {
+            Self::ensure_budget(db, ProviderType::OpenRouter)?;
+        }
+        Ok(())
+    }
+
+    /// Build from the frozen identity, resolving current credentials only at
+    /// the last possible moment. Saved chat/model preferences cannot retarget it.
+    pub(crate) async fn embed_profile_request(
+        db: &Database,
+        profile: &crate::db::embedding_generations::EmbeddingProfile,
+        text: &str,
+        probing: bool,
+    ) -> Result<crate::ai::provider::EmbeddingResult> {
+        use crate::db::embedding_generations::{Corpus, DimensionPolicy};
+        Self::authorize_embedding(db, profile, Corpus::Emails)?;
+        let expected = (!probing).then_some(profile.dimensions);
+        let result;
+        let destination;
+        match profile.backend.as_str() {
+            "openrouter" => {
+                if profile.endpoint.as_deref() != Some("https://openrouter.ai/api/v1") {
+                    return Err(AppError::InvalidInput(
+                        "OpenRouter embedding endpoint does not match its trusted destination".into(),
+                    ));
+                }
+                destination = ProviderType::OpenRouter;
+                Self::ensure_budget(db, destination)?;
+                let client =
+                    OpenRouterClient::new(Self::load_openrouter_api_key(db)?, String::new(), profile.model.clone())
+                        .with_zero_data_retention(db.get_preference(OPENROUTER_ZDR_PREF)?.as_deref() == Some("true"));
+                result = client.embed_profile(text, &profile.dimension_policy, expected).await?;
+            }
+            ai_server::PROVIDER_ID => {
+                let endpoint = profile
+                    .endpoint
+                    .as_deref()
+                    .ok_or_else(|| AppError::InvalidInput("Embedding server endpoint is missing".into()))?;
+                let endpoint = normalize_ai_base_url(endpoint)?;
+                let server = ai_server::load_server_settings(db)?;
+                // Exact endpoint equality also protects same-origin path changes:
+                // never send current credentials to a previous/replaced service.
+                if server
+                    .base_url
+                    .as_deref()
+                    .map(normalize_ai_base_url)
+                    .transpose()?
+                    .as_deref()
+                    != Some(endpoint.as_str())
+                {
+                    return Err(AppError::InvalidInput("The saved embedding server changed. Review its endpoint and credentials before resuming this profile".into()));
+                }
+                let (host, local) = ai_base_url_host(&endpoint)
+                    .ok_or_else(|| AppError::InvalidInput("Invalid embedding server host".into()))?;
+                if !local
+                    && !server
+                        .disclosed_host
+                        .as_deref()
+                        .is_some_and(|h| h.eq_ignore_ascii_case(&host))
+                {
+                    return Err(AppError::InvalidInput(format!(
+                        "Confirm that embedding content may be sent to {host} before continuing"
+                    )));
+                }
+                destination = ProviderType::OpenAiCompatible;
+                let client = OpenRouterClient::openai_compatible(
+                    &endpoint,
+                    ai_server::load_api_key(db)?,
+                    String::new(),
+                    profile.model.clone(),
+                );
+                result = client.embed_profile(text, &profile.dimension_policy, expected).await?;
+            }
+            "ollama" => {
+                let endpoint = profile
+                    .endpoint
+                    .as_deref()
+                    .ok_or_else(|| AppError::InvalidInput("Ollama embedding endpoint is missing".into()))?;
+                destination = ProviderType::Ollama;
+                let provider =
+                    OllamaClient::new_with_models(None, Some(&profile.model)).with_embedding_endpoint(endpoint)?;
+                result = provider.embed(text).await?;
+            }
+            "llamacpp" => {
+                if profile.endpoint.is_some() {
+                    return Err(AppError::InvalidInput(
+                        "In-app embeddings cannot have a remote endpoint".into(),
+                    ));
+                }
+                destination = ProviderType::LlamaCpp;
+                result = Self::in_app_embedder(db, &profile.model)?.embed(text).await?;
+            }
+            _ => return Err(AppError::InvalidInput("Unknown embedding backend".into())),
+        }
+        let size = match profile.dimension_policy {
+            DimensionPolicy::Explicit(n) => Some(n),
+            DimensionPolicy::Native => expected,
+        };
+        crate::ai::openrouter::validate_embedding_vector(&result.embedding, size)?;
+        if result.cost_usd > 0.0 {
+            Self::record_provider_call(
+                db,
+                destination,
+                &profile.model,
+                "embed",
+                result.tokens,
+                0,
+                result.cost_usd,
+            )?;
+        }
+        Ok(result)
+    }
+
     fn env_openrouter_api_key() -> Option<String> {
         std::env::var("OPENROUTER_API_KEY")
             .ok()
@@ -418,12 +908,33 @@ impl AiService {
         cfg!(debug_assertions)
     }
 
+    fn openrouter_dev_key_preference(db: &Database) -> Result<String> {
+        Ok(match db.get_preference("openrouter_api_key_id")? {
+            Some(id) if id != OPENROUTER_KEY_ID => format!("{OPENROUTER_DEV_KEY_PREF}:{id}"),
+            _ => OPENROUTER_DEV_KEY_PREF.into(),
+        })
+    }
+
+    fn stage_openrouter_api_key(key: &str) -> Result<Vec<(String, Option<String>)>> {
+        if Self::env_openrouter_api_key().is_some() {
+            return Ok(Vec::new());
+        }
+        let id = format!("openrouter_api_key:{}", uuid::Uuid::new_v4());
+        let mut writes = vec![("openrouter_api_key_id".into(), Some(id.clone()))];
+        if Self::use_dev_ai_keys() {
+            writes.push((format!("{OPENROUTER_DEV_KEY_PREF}:{id}"), Some(key.into())));
+        } else {
+            super::secrets_vault::set(KEYRING_SERVICE, &id, key)?;
+        }
+        Ok(writes)
+    }
+
     pub fn has_openrouter_api_key(db: &Database) -> Result<bool> {
         if Self::env_openrouter_api_key().is_some() {
             return Ok(true);
         }
         if Self::use_dev_ai_keys() {
-            return Ok(db.get_preference(OPENROUTER_DEV_KEY_PREF)?.is_some());
+            return Ok(db.get_preference(&Self::openrouter_dev_key_preference(db)?)?.is_some());
         }
         Ok(db.get_preference("openrouter_api_key_id")?.is_some())
     }
@@ -434,7 +945,7 @@ impl AiService {
         }
         if Self::use_dev_ai_keys() {
             return db
-                .get_preference(OPENROUTER_DEV_KEY_PREF)?
+                .get_preference(&Self::openrouter_dev_key_preference(db)?)?
                 .ok_or_else(|| AppError::AiError("OpenRouter API key not configured".to_string()));
         }
 
@@ -541,9 +1052,14 @@ impl AiService {
     fn openrouter_client(db: &Database, config: AiConfig) -> Result<OpenRouterClient> {
         let key = Self::load_openrouter_api_key(db)?;
         let dimensions = Self::openrouter_embedding_dimensions(db, &config.embedding_model)?;
+        let observed = db
+            .get_preference("openrouter_embedding_actual_dimensions")?
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(crate::db::embeddings::EMAIL_EMBEDDING_DIM);
         Ok(OpenRouterClient::new(key, config.model, config.embedding_model)
             .with_zero_data_retention(config.zero_data_retention)
-            .with_embedding_dimensions(dimensions))
+            .with_embedding_dimensions(dimensions)
+            .with_observed_embedding_dimensions(observed))
     }
 
     /// How `embedding_model` was validated for OpenRouter, or `None` when it
@@ -633,7 +1149,11 @@ impl AiService {
             )?;
         }
         db.set_preference(OPENROUTER_EMBED_VALIDATED_PREF, client.embedding_model_name())?;
-        db.set_preference(OPENROUTER_EMBED_DIMENSIONS_PREF, probe.dimensions.as_pref())?;
+        db.set_preference(OPENROUTER_EMBED_DIMENSIONS_PREF, &probe.dimensions.as_pref())?;
+        db.set_preference(
+            "openrouter_embedding_actual_dimensions",
+            &crate::db::embeddings::EMAIL_EMBEDDING_DIM.to_string(),
+        )?;
         Ok(probe.dimensions)
     }
 
@@ -878,6 +1398,26 @@ impl AiService {
     /// embedding model is probed once here and refused when it returns no
     /// vectors the email index can hold.
     pub async fn prepare_ai_settings(db: &Database, input: AiSettingsInput) -> Result<PreparedAiSettings> {
+        Self::prepare_ai_settings_inner(db, input, None, true).await
+    }
+
+    /// Stage 4 settings contract. Existing callers retain a previously saved
+    /// policy, with Explicit(768) as the default for an unprobed legacy choice.
+    pub async fn prepare_ai_settings_with_dimension_policy(
+        db: &Database,
+        input: AiSettingsInput,
+        policy: crate::db::embedding_generations::DimensionPolicy,
+    ) -> Result<PreparedAiSettings> {
+        Self::prepare_ai_settings_inner(db, input, Some(policy), true).await
+    }
+
+    async fn prepare_ai_settings_inner(
+        db: &Database,
+        input: AiSettingsInput,
+        policy: Option<crate::db::embedding_generations::DimensionPolicy>,
+        probe_embedding: bool,
+    ) -> Result<PreparedAiSettings> {
+        use crate::db::embedding_generations::DimensionPolicy;
         if !PROVIDERS.contains(&input.provider.as_str()) {
             return Err(AppError::InvalidInput(format!(
                 "Unknown AI provider \"{}\"",
@@ -906,14 +1446,45 @@ impl AiService {
                 "Choose a chat model for the server.".to_string(),
             ));
         }
-        let previous = ai_server::load_server_settings(db)?.disclosed_host;
-        let plan = ai_server::plan_server_settings(server_input, previous.as_deref(), in_app_embeddings_supported())?;
+        let previous = ai_server::load_server_settings(db)?;
+        let plan = ai_server::plan_server_settings(
+            server_input,
+            previous.disclosed_host.as_deref(),
+            in_app_embeddings_supported(),
+        )?;
+        if previous.has_api_key
+            && plan.key == ai_server::KeyChange::Keep
+            && previous
+                .base_url
+                .as_deref()
+                .map(normalize_ai_base_url)
+                .transpose()?
+                .as_deref()
+                != Some(plan.base_url.as_str())
+        {
+            return Err(AppError::InvalidInput("Changing a keyed server endpoint requires entering its API key again or explicitly removing the stored key".into()));
+        }
 
         let mut server_embedding = None;
         let embedding_model = input.embedding_model.as_deref().unwrap_or_default().trim();
-        if plan.embedding_source == EmbeddingSource::Server
+        let previously_validated = Self::server_embedding_dimensions(db, &plan.base_url, embedding_model)?;
+        let previous_size = db
+            .get_preference("openai_compatible_embedding_actual_dimensions")?
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(crate::db::embeddings::EMAIL_EMBEDDING_DIM);
+        let requested_policy = policy
+            .clone()
+            .unwrap_or(DimensionPolicy::Explicit(crate::db::embeddings::EMAIL_EMBEDDING_DIM));
+        let previous_policy = previously_validated.map(|mode| match mode {
+            EmbeddingDimensions::Native => DimensionPolicy::Native,
+            EmbeddingDimensions::Requested => DimensionPolicy::Explicit(crate::db::embeddings::EMAIL_EMBEDDING_DIM),
+            EmbeddingDimensions::Explicit(n) => DimensionPolicy::Explicit(n),
+        });
+        let policy_changed = policy.is_some() && previous_policy.as_ref() != Some(&requested_policy);
+        if probe_embedding
+            && plan.embedding_source == EmbeddingSource::Server
             && !embedding_model.is_empty()
-            && Self::server_embedding_dimensions(db, &plan.base_url, embedding_model)?.is_none()
+            && (previously_validated.is_none() || policy_changed || previous_size == 0)
         {
             let key = match &plan.key {
                 ai_server::KeyChange::Set(key) => key.clone(),
@@ -926,8 +1497,26 @@ impl AiService {
                 input.model.clone(),
                 embedding_model.to_string(),
             );
-            let probe = client.probe_embedding().await?;
-            server_embedding = Some((server_embedding_key(&plan.base_url, embedding_model), probe.dimensions));
+            if !db.is_ai_enabled()? {
+                return Err(AppError::AiDisabled);
+            }
+            // Explicit proposed settings and plan_server_settings disclosure
+            // authorize this neutral probe before any preferences are published.
+            let probe = client
+                .embed_profile(super::embedding_session::CANARY_TEXT, &requested_policy, None)
+                .await?;
+            let mode = match requested_policy {
+                DimensionPolicy::Native => EmbeddingDimensions::Native,
+                DimensionPolicy::Explicit(n) if n == crate::db::embeddings::EMAIL_EMBEDDING_DIM => {
+                    EmbeddingDimensions::Requested
+                }
+                DimensionPolicy::Explicit(n) => EmbeddingDimensions::Explicit(n),
+            };
+            server_embedding = Some((
+                server_embedding_key(&plan.base_url, embedding_model),
+                mode,
+                probe.embedding.len(),
+            ));
         }
 
         Ok(PreparedAiSettings {
@@ -954,9 +1543,10 @@ impl AiService {
             ai_server::apply_key_change(db, &plan.key, Self::use_dev_ai_keys())?;
             ai_server::store_server_settings(db, plan)?;
         }
-        if let Some((validated, dimensions)) = &server_embedding {
+        if let Some((validated, dimensions, actual)) = &server_embedding {
             db.set_preference(ai_server::EMBED_VALIDATED_PREF, validated)?;
-            db.set_preference(ai_server::EMBED_DIMENSIONS_PREF, dimensions.as_pref())?;
+            db.set_preference(ai_server::EMBED_DIMENSIONS_PREF, &dimensions.as_pref())?;
+            db.set_preference("openai_compatible_embedding_actual_dimensions", &actual.to_string())?;
         }
         Self::save_config(
             db,
@@ -1002,9 +1592,14 @@ impl AiService {
             String::new()
         };
         let dimensions = Self::server_embedding_dimensions(db, &base_url, &server_embedding_model)?;
+        let observed = db
+            .get_preference("openai_compatible_embedding_actual_dimensions")?
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(crate::db::embeddings::EMAIL_EMBEDDING_DIM);
         let chat = OpenRouterClient::openai_compatible(&base_url, key, config.model.clone(), server_embedding_model)
             .with_context_window(context_window)
-            .with_embedding_dimensions(dimensions);
+            .with_embedding_dimensions(dimensions)
+            .with_observed_embedding_dimensions(observed);
         let embeddings: Arc<dyn AIProvider> = match server.embedding_source {
             EmbeddingSource::Server => return Ok(Arc::new(chat)),
             EmbeddingSource::OpenRouter => Arc::new(Self::openrouter_client(db, config)?),
@@ -2666,6 +3261,74 @@ mod server_provider_tests {
     }
 
     #[tokio::test]
+    async fn prepared_embedding_settings_probe_unsaved_destination_and_stage_keys_without_replacing_current() {
+        use crate::db::embedding_generations::DimensionPolicy;
+        let old_server = MockServer::start().await;
+        let new_server = embedding_server(4096).await;
+        let db = db();
+        let mut old = settings(&old_server, "", EmbeddingSource::Server);
+        old.server.as_mut().unwrap().api_key = Some("synthetic-old-key".into());
+        save(&db, old).await.unwrap();
+        let mut proposed = settings(&new_server, "native-embed", EmbeddingSource::Server);
+        proposed.server.as_mut().unwrap().api_key = Some("synthetic-proposed-key".into());
+        let prepared = AiService::prepare_embedding_settings(&db, proposed.clone(), DimensionPolicy::Native, None)
+            .await
+            .unwrap();
+        assert_eq!(prepared.profile.endpoint.as_deref(), Some(new_server.uri().as_str()));
+        assert_eq!(prepared.profile.dimensions, 4096);
+        assert_eq!(
+            ai_server::load_server_settings(&db).unwrap().base_url,
+            Some(old_server.uri())
+        );
+        assert_eq!(ai_server::load_api_key(&db).unwrap(), "synthetic-old-key");
+        let staged = prepared.stage_credentials(&db).unwrap();
+        assert!(staged.iter().any(|(key, _)| key == "openai_compatible_api_key_id"));
+        assert_eq!(
+            ai_server::load_api_key(&db).unwrap(),
+            "synthetic-old-key",
+            "staging never overwrites current credentials"
+        );
+        let reprobed =
+            AiService::prepare_embedding_settings(&db, proposed, DimensionPolicy::Native, Some(&prepared.profile))
+                .await
+                .unwrap();
+        assert_eq!(
+            reprobed.profile.fingerprint().unwrap(),
+            prepared.profile.fingerprint().unwrap()
+        );
+        assert!(db.embedding_generation_control().unwrap().pending_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_native_contract_accepts_4096_without_changing_existing_768_default() {
+        use crate::db::embedding_generations::DimensionPolicy;
+        let server = embedding_server(4096).await;
+        let db = db();
+        let input = settings(&server, "native-embed", EmbeddingSource::Server);
+        assert!(AiService::prepare_ai_settings(&db, input.clone()).await.is_err());
+        assert_eq!(db.get_preference("ai_provider").unwrap(), None);
+        let prepared = AiService::prepare_ai_settings_with_dimension_policy(&db, input, DimensionPolicy::Native)
+            .await
+            .unwrap();
+        AiService::apply_ai_settings(&db, prepared).unwrap();
+        assert_eq!(
+            db.get_preference("openai_compatible_embedding_actual_dimensions")
+                .unwrap()
+                .as_deref(),
+            Some("4096")
+        );
+        assert_eq!(
+            db.get_preference(ai_server::EMBED_DIMENSIONS_PREF).unwrap().as_deref(),
+            Some("native")
+        );
+        let control = db.embedding_generation_control().unwrap();
+        assert!(
+            control.active_id.is_none() && control.pending_id.is_none(),
+            "settings probing never destroys or builds indexes"
+        );
+    }
+
+    #[tokio::test]
     async fn a_model_without_vectors_is_refused_and_nothing_is_saved() {
         let server = embedding_server(0).await;
         let db = db();
@@ -2678,6 +3341,23 @@ mod server_provider_tests {
             crate::services::ai_server::load_server_settings(&db).unwrap().base_url,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn changing_a_keyed_server_endpoint_requires_explicit_credential_choice() {
+        let old_server = MockServer::start().await;
+        let new_server = MockServer::start().await;
+        let db = db();
+        let mut first = settings(&old_server, "", EmbeddingSource::Server);
+        first.server.as_mut().unwrap().api_key = Some("synthetic-key".into());
+        save(&db, first).await.unwrap();
+        let second = settings(&new_server, "", EmbeddingSource::Server);
+        assert!(save(&db, second).await.is_err());
+        assert_eq!(
+            ai_server::load_server_settings(&db).unwrap().base_url,
+            Some(old_server.uri())
+        );
+        assert!(new_server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

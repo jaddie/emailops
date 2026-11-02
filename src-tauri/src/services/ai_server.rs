@@ -245,6 +245,42 @@ pub(crate) fn store_server_settings(db: &Database, plan: &ServerSettingsPlan) ->
     Ok(())
 }
 
+/// A validated settings plan as database writes, for the combined settings/index
+/// transaction. No preferences or credentials change while preparing this list.
+pub(crate) fn server_preference_writes(plan: &ServerSettingsPlan) -> Vec<(String, Option<String>)> {
+    vec![
+        (BASE_URL_PREF.into(), Some(plan.base_url.clone())),
+        (
+            EMBEDDING_SOURCE_PREF.into(),
+            Some(plan.embedding_source.as_pref().into()),
+        ),
+        (CONTEXT_WINDOW_PREF.into(), Some(plan.context_window.to_string())),
+        (DISCLOSED_HOST_PREF.into(), plan.disclosed_host.clone()),
+    ]
+}
+
+/// Stage a new secret under an unreferenced versioned vault ID. Only the later
+/// SQLite commit grants it authority. Failure leaves the currently referenced
+/// key untouched; an orphaned new vault entry cannot be loaded by any profile.
+/// Debug builds include the secret in the same SQLite transaction as its marker.
+pub(crate) fn stage_key_change(_db: &Database, change: &KeyChange, dev: bool) -> Result<Vec<(String, Option<String>)>> {
+    Ok(match change {
+        KeyChange::Keep => Vec::new(),
+        KeyChange::Set(key) if dev => vec![
+            (DEV_KEY_PREF.into(), Some(key.clone())),
+            (KEY_ID_PREF.into(), Some(KEY_ID.into())),
+        ],
+        KeyChange::Set(key) => {
+            let id = format!("{KEY_ID}:{}", uuid::Uuid::new_v4());
+            crate::services::secrets_vault::set(KEYRING_SERVICE, &id, key)?;
+            vec![(KEY_ID_PREF.into(), Some(id)), (DEV_KEY_PREF.into(), None)]
+        }
+        // Clearing authority is atomic with the settings commit. Do not delete
+        // the previous vault entry first: a failed DB transaction must retain it.
+        KeyChange::Clear => vec![(KEY_ID_PREF.into(), None), (DEV_KEY_PREF.into(), None)],
+    })
+}
+
 /// The stored server settings.
 pub fn load_server_settings(db: &Database) -> Result<ServerSettings> {
     Ok(ServerSettings {
@@ -303,7 +339,10 @@ pub(crate) fn load_api_key_from(db: &Database, dev: bool) -> Result<String> {
     let key = if dev {
         db.get_preference(DEV_KEY_PREF)?
     } else {
-        crate::services::secrets_vault::get(KEYRING_SERVICE, KEY_ID)?
+        let id = db
+            .get_preference(KEY_ID_PREF)?
+            .ok_or_else(|| AppError::InvalidInput("The server API key reference was revoked".into()))?;
+        crate::services::secrets_vault::get(KEYRING_SERVICE, &id)?
     };
     Ok(key.unwrap_or_default())
 }
@@ -536,6 +575,48 @@ mod key_tests {
             .unwrap();
         assert!(!prefs.iter().any(|v| v.contains("sk-server")), "{prefs:?}");
         assert!(load_server_settings(&db).unwrap().has_api_key);
+    }
+
+    #[test]
+    fn staged_versioned_key_has_no_authority_until_sqlite_commit_and_clear_cannot_resurrect_it() {
+        let (_guard, _kc, db) = setup();
+        apply_key_change(&db, &KeyChange::Set("original-fixture-key".into()), false).unwrap();
+        let writes = stage_key_change(&db, &KeyChange::Set("replacement-fixture-key".into()), false).unwrap();
+        assert_eq!(load_api_key_from(&db, false).unwrap(), "original-fixture-key");
+        {
+            let mut conn = db.connection();
+            let tx = conn.transaction().unwrap();
+            for (key, value) in &writes {
+                if let Some(value) = value {
+                    tx.execute("INSERT INTO user_preferences(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![key,value]).unwrap();
+                }
+            }
+            // Simulated candidate/settings transaction failure.
+            tx.rollback().unwrap();
+        }
+        assert_eq!(load_api_key_from(&db, false).unwrap(), "original-fixture-key");
+        for (key, value) in &writes {
+            match value {
+                Some(value) => db.set_preference(key, value).unwrap(),
+                None => db.delete_preference(key).unwrap(),
+            }
+        }
+        assert_eq!(load_api_key_from(&db, false).unwrap(), "replacement-fixture-key");
+        assert_eq!(
+            crate::services::secrets_vault::get(KEYRING_SERVICE, KEY_ID)
+                .unwrap()
+                .as_deref(),
+            Some("original-fixture-key"),
+            "staging never overwrites the original vault entry"
+        );
+        for (key, value) in stage_key_change(&db, &KeyChange::Clear, false).unwrap() {
+            assert!(value.is_none());
+            db.delete_preference(&key).unwrap();
+        }
+        assert!(
+            load_api_key_from(&db, false).unwrap().is_empty(),
+            "unreferenced vault entries cannot restore revoked authority"
+        );
     }
 
     #[test]

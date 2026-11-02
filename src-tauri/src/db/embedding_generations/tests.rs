@@ -27,7 +27,8 @@ fn file_db() -> (TempDir, Database) {
 
 fn seed(conn: &Connection) {
     conn.execute_batch(
-        "INSERT INTO accounts(id,provider,email,name,created_at) VALUES('account-a','gmail','fixture@example.test','Fixture',0);
+        "INSERT OR REPLACE INTO user_preferences(key,value) VALUES('memory_enabled','true');
+         INSERT INTO accounts(id,provider,email,name,created_at) VALUES('account-a','gmail','fixture@example.test','Fixture',0);
          INSERT INTO emails(id,account_id,thread_id,subject,sender,sender_email,recipients_json,snippet,timestamp,created_at)
            VALUES('email-a','account-a','thread-a','Fixture subject','Fixture sender','sender@example.test','[]','Fixture snippet',1,1);
          INSERT INTO email_bodies(email_id,body) VALUES('email-a','Complete synthetic body');
@@ -122,6 +123,212 @@ fn profile_fingerprints_cover_every_identity_field_and_full_input() {
     changed = p;
     changed.dimension_policy = DimensionPolicy::Explicit(4096);
     assert!(changed.fingerprint().is_err());
+}
+
+#[test]
+fn managed_queries_reject_stale_identity_and_filter_before_top_k() {
+    let (_dir, db) = file_db();
+    seed(&db.connection());
+    let lease = prepare(&db, 4096);
+    populate(&db, &lease, 4096);
+    activate(&db, &lease);
+    let active = db.active_embedding_write_lease().unwrap().unwrap();
+    let query = TypedQueryEmbedding::new(active.clone(), &profile(4096), "query", vector(4096, 0)).unwrap();
+    assert_eq!(
+        db.search_generation_vectors(&query, "query", Corpus::Emails, Some("account-a"), &[], None, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(db
+        .search_generation_vectors(
+            &query,
+            "different input",
+            Corpus::Emails,
+            Some("account-a"),
+            &[],
+            None,
+            1
+        )
+        .is_err());
+    assert!(db
+        .search_generation_vectors(&query, "query", Corpus::Emails, Some("other-account"), &[], None, 1)
+        .unwrap()
+        .is_empty());
+    assert!(TypedQueryEmbedding::new(active, &profile(4096), "query", vector(768, 0)).is_err());
+    let next = prepare(&db, 768);
+    let still_active = db.active_embedding_write_lease().unwrap().unwrap();
+    let during_build = TypedQueryEmbedding::new(still_active, &profile(4096), "query", vector(4096, 0)).unwrap();
+    assert_eq!(
+        db.search_generation_vectors(&during_build, "query", Corpus::Emails, Some("account-a"), &[], None, 1)
+            .unwrap()
+            .len(),
+        1,
+        "replacement construction must preserve active retrieval"
+    );
+    populate(&db, &next, 768);
+    activate(&db, &next);
+    assert!(db
+        .search_generation_vectors(&query, "query", Corpus::Emails, Some("account-a"), &[], None, 1)
+        .is_err());
+}
+
+#[test]
+fn managed_knn_prefilters_other_accounts_and_categories_before_candidate_budget() {
+    let (_dir, db) = file_db();
+    seed(&db.connection());
+    db.set_preference("embeddings_categories:account-a", "[]").unwrap();
+    {
+        let conn = db.connection();
+        conn.execute("INSERT INTO accounts(id,provider,email,name,created_at) VALUES('other','gmail','other@example.test','Other',0)",[]).unwrap();
+        for n in 0..12 {
+            for (account, category) in [("other", "primary"), ("account-a", "promotions")] {
+                conn.execute("INSERT INTO emails(id,account_id,thread_id,subject,sender,sender_email,recipients_json,snippet,timestamp,category,created_at) VALUES(?1,?2,?1,'Excluded neighbour','Fixture','fixture@example.test','[]','Synthetic',1,?3,1)",params![format!("competitor-{account}-{n}"),account,category]).unwrap();
+            }
+        }
+    }
+    let lease = prepare(&db, 768);
+    let source = db
+        .embedding_generation_sources(lease.generation_id, Corpus::Emails, 100)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.source_id == "email-a")
+        .unwrap();
+    populate(&db, &lease, 768);
+    db.store_generation_embeddings(
+        &lease,
+        &source,
+        &["Allowed distant neighbour".into()],
+        &[vector(768, 1)],
+    )
+    .unwrap();
+    activate(&db, &lease);
+    let query = TypedQueryEmbedding::new(
+        db.active_embedding_write_lease().unwrap().unwrap(),
+        &profile(768),
+        "query",
+        vector(768, 0),
+    )
+    .unwrap();
+    let hits = db
+        .search_generation_vectors(
+            &query,
+            "query",
+            Corpus::Emails,
+            Some("account-a"),
+            &["primary".into()],
+            None,
+            1,
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].source_id, "email-a");
+    db.connection()
+        .execute("UPDATE emails SET mailbox='spam' WHERE id='email-a'", [])
+        .unwrap();
+    assert!(db
+        .search_generation_vectors(
+            &query,
+            "query",
+            Corpus::Emails,
+            Some("account-a"),
+            &["primary".into()],
+            None,
+            1
+        )
+        .unwrap()
+        .is_empty());
+    db.connection()
+        .execute("UPDATE memory_facts SET status='retired' WHERE id='fact-a'", [])
+        .unwrap();
+    assert!(db
+        .search_generation_vectors(&query, "query", Corpus::MemoryFacts, Some("account-a"), &[], None, 1)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn settings_and_replacement_job_commit_atomically_without_changing_active_profile() {
+    let (_dir, db) = file_db();
+    seed(&db.connection());
+    let active = prepare(&db, 768);
+    populate(&db, &active, 768);
+    activate(&db, &active);
+    db.set_preference("ai_embedding_model", "original-model").unwrap();
+    db.set_preference("openai_compatible_api_key_id", "original-key-reference")
+        .unwrap();
+    let revision = db.embedding_generation_control().unwrap().revision;
+    let writes = vec![
+        ("ai_embedding_model".into(), Some("replacement-model".into())),
+        (
+            "openai_compatible_api_key_id".into(),
+            Some("new-staged-reference".into()),
+        ),
+        (
+            "openai_compatible_embedding_actual_dimensions".into(),
+            Some("4096".into()),
+        ),
+    ];
+    db.connection().execute_batch("CREATE TEMP TRIGGER reject_new_candidate BEFORE INSERT ON embedding_generations BEGIN SELECT RAISE(ABORT,'synthetic candidate failure'); END;").unwrap();
+    assert!(db
+        .prepare_embedding_generation_with_preferences(&profile(4096), &Corpus::ALL, revision, &writes)
+        .is_err());
+    assert_eq!(
+        db.get_preference("ai_embedding_model").unwrap().as_deref(),
+        Some("original-model")
+    );
+    assert_eq!(
+        db.get_preference("openai_compatible_api_key_id").unwrap().as_deref(),
+        Some("original-key-reference")
+    );
+    assert!(db
+        .get_preference("openai_compatible_embedding_actual_dimensions")
+        .unwrap()
+        .is_none());
+    assert_eq!(db.embedding_generation_control().unwrap().pending_id, None);
+    assert_eq!(db.embedding_generation_control().unwrap().revision, revision);
+    db.connection()
+        .execute_batch("DROP TRIGGER reject_new_candidate;")
+        .unwrap();
+    assert!(db
+        .prepare_embedding_generation_with_preferences(&profile(4096), &Corpus::ALL, revision - 1, &writes)
+        .is_err());
+    let replacement = db
+        .prepare_embedding_generation_with_preferences(&profile(4096), &Corpus::ALL, revision, &writes)
+        .unwrap();
+    assert_eq!(
+        db.get_preference("ai_embedding_model").unwrap().as_deref(),
+        Some("replacement-model")
+    );
+    let control = db.embedding_generation_control().unwrap();
+    assert_eq!(control.pending_id, Some(replacement.generation_id));
+    assert_eq!(control.active_id, Some(active.generation_id));
+    assert_eq!(
+        db.embedding_generation_profile(active.generation_id)
+            .unwrap()
+            .dimensions,
+        768
+    );
+    assert_eq!(
+        db.embedding_generation_profile(replacement.generation_id)
+            .unwrap()
+            .dimensions,
+        4096
+    );
+    let query = TypedQueryEmbedding::new(
+        db.active_embedding_write_lease().unwrap().unwrap(),
+        &profile(768),
+        "query",
+        vector(768, 0),
+    )
+    .unwrap();
+    assert_eq!(
+        db.search_generation_vectors(&query, "query", Corpus::Emails, Some("account-a"), &[], None, 1)
+            .unwrap()
+            .len(),
+        1,
+        "combined settings commit preserves active retrieval under its old profile"
+    );
 }
 
 #[test]
@@ -635,6 +842,8 @@ fn rollback_catches_up_and_restores_profile_without_restoring_revoked_permission
 #[test]
 fn real_embedding_preference_writers_fence_validated_candidates() {
     for key in [
+        "openai_compatible_embedding_actual_dimensions",
+        "openrouter_embedding_actual_dimensions",
         "ai_embedding_model",
         "ai_provider",
         "openai_compatible_base_url",

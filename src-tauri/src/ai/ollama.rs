@@ -403,6 +403,22 @@ impl OllamaClient {
         }
     }
 
+    /// Resolve the configured destination once when constructing a frozen profile.
+    pub(crate) fn configured_base_url() -> Result<String> {
+        ollama_base_url()
+    }
+
+    /// Pin embedding traffic to a saved profile rather than mutable OLLAMA_HOST.
+    pub(crate) fn with_embedding_endpoint(mut self, base_url: &str) -> Result<Self> {
+        self.base_url = Ok(crate::services::ai::normalize_ai_base_url(base_url)?);
+        self.client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| AppError::AiError(format!("Cannot create embedding client: {e}")))?;
+        Ok(self)
+    }
+
     /// Override the `keep_alive` window applied to every Ollama request.
     /// Accepts any duration string Ollama recognises ("30m", "1h", "0" to
     /// evict immediately, "-1" to pin forever).

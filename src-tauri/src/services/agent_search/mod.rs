@@ -254,7 +254,7 @@ async fn run_hybrid(
 
     // 2) Vector: embed the semantic_query (or full query) and KNN search.
     let mut vec_email_ids: Vec<(String, f32)> = Vec::new();
-    if let Some(ai_ref) = ai {
+    if ai.is_some() {
         let embed_text = plan
             .map(|p| {
                 if p.semantic_query.is_empty() {
@@ -265,13 +265,14 @@ async fn run_hybrid(
             })
             .unwrap_or_else(|| query.to_string());
 
-        match ai_ref.embed(&embed_text).await {
-            Ok(vec) => {
+        match crate::services::embedding_runtime::embed_query(db, &embed_text).await {
+            Ok(Some(vec)) => {
                 match fetch_vector(
                     db,
                     VectorRequest {
                         account_id,
                         embedding: &vec,
+                        exact_input: &embed_text,
                         categories: cats,
                         limit: HYBRID_POOL_SIZE,
                     },
@@ -288,6 +289,7 @@ async fn run_hybrid(
                     }
                 }
             }
+            Ok(None) => {}
             Err(e) => {
                 crate::services::logger::log(
                     "error",

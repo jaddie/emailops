@@ -20,7 +20,7 @@ use crate::models::error::Result;
 use crate::models::{HelpChunk, HelpTrace};
 use crate::services::retrieval::{fuse_rrf, Ranking, DEFAULT_RRF_K};
 
-use super::index::embedding_model_label;
+use crate::db::embedding_generations::{Corpus, TypedQueryEmbedding};
 
 /// Cosine similarity a section must reach (against the question) to ride in
 /// the prompt. Below it the question is about the mailbox, not the app.
@@ -305,9 +305,9 @@ pub fn merge_page_and_global(on_page: Vec<HelpSource>, global: Vec<HelpSource>) 
 /// [`merge_page_and_global`]).
 pub async fn lookup_help(
     db: &Arc<Database>,
-    provider: &dyn AIProvider,
+    _provider: &dyn AIProvider,
     query: &str,
-    query_embedding: Option<&[f32]>,
+    query_embedding: Option<&TypedQueryEmbedding>,
     ui_lang: &str,
     k: usize,
     page: Option<&str>,
@@ -317,19 +317,22 @@ pub async fn lookup_help(
         lang: ui_lang.to_string(),
         ..HelpTrace::default()
     };
-    if db.count_help_doc_chunks()? == 0 {
+    if !db.is_help_docs_enabled()? || db.count_help_doc_chunks()? == 0 {
         trace.elapsed_ms = t0.elapsed().as_millis() as i64;
         return Ok((Vec::new(), trace));
     }
-    let model = embedding_model_label(db);
-    let vector_available = provider.embedding_configured() && db.count_help_chunks_embedded_with(&model)? > 0;
+    let vector_available = db.active_embedding_write_lease()?.is_some();
     trace.vector_available = vector_available;
-
-    let embedding: Option<Vec<f32>> = if vector_available {
-        match query_embedding {
-            Some(e) => Some(e.to_vec()),
-            None => match timeout(HELP_LOOKUP_TIMEOUT, provider.embed(query)).await {
-                Ok(Ok(r)) => Some(r.embedding),
+    let embedding: Option<TypedQueryEmbedding> = if vector_available {
+        match query_embedding.filter(|e| e.matches_input(query)) {
+            Some(e) => Some(e.clone()),
+            None => match timeout(
+                HELP_LOOKUP_TIMEOUT,
+                crate::services::embedding_runtime::embed_query_for(db, Corpus::HelpDocs, query),
+            )
+            .await
+            {
+                Ok(Ok(e)) => e,
                 Ok(Err(e)) => {
                     log("warn", format!("help lookup: embedding failed ({e}); FTS only"));
                     None
@@ -346,8 +349,7 @@ pub async fn lookup_help(
     let ranker = SectionRanker {
         db,
         query,
-        embedding: embedding.as_deref(),
-        model: &model,
+        embedding: embedding.as_ref(),
         ui_lang,
     };
 
@@ -372,8 +374,7 @@ pub async fn lookup_help(
 struct SectionRanker<'a> {
     db: &'a Arc<Database>,
     query: &'a str,
-    embedding: Option<&'a [f32]>,
-    model: &'a str,
+    embedding: Option<&'a TypedQueryEmbedding>,
     ui_lang: &'a str,
 }
 
@@ -381,7 +382,21 @@ impl SectionRanker<'_> {
     fn rank(&self, k: usize, page: Option<&str>, trace: &mut HelpTrace) -> Result<Vec<HelpSource>> {
         let (db, ui_lang) = (self.db, self.ui_lang);
         let vec_hits: Vec<(i64, f32)> = match self.embedding {
-            Some(e) => db.vec_search_help_docs(e, self.model, HELP_CANDIDATES, page)?,
+            Some(e) => {
+                match db.search_generation_vectors(e, self.query, Corpus::HelpDocs, None, &[], page, HELP_CANDIDATES) {
+                    Ok(hits) => hits
+                        .into_iter()
+                        .filter_map(|h| h.help_rowid.map(|r| (r, h.similarity)))
+                        .collect(),
+                    Err(error) => {
+                        log(
+                            "warn",
+                            format!("help lookup: managed index unavailable ({error}); FTS only"),
+                        );
+                        Vec::new()
+                    }
+                }
+            }
             None => Vec::new(),
         };
         let fts_hits = db.fts_search_help_docs(self.query, HELP_CANDIDATES as i32, page)?;

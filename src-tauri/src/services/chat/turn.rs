@@ -5004,49 +5004,52 @@ async fn run_chat_turn_inner(
     // final ChatTrace.
     let t_retrieve = std::time::Instant::now();
     emit_log("info", "stage: retrieve");
-    let (sources, retrieval_trace, query_embedding): (Vec<ScoredEmail>, Option<RetrievalTrace>, Option<Vec<f32>>) =
-        match &route.mode {
-            _ if research_active => {
-                emit_log("info", "retrieve: skipped (research mode gathers its own candidates)");
-                (Vec::new(), None, None)
-            }
-            RouteMode::ToolsFirst => {
-                emit_log("info", "retrieve: skipped (ToolsFirst route)");
-                (Vec::new(), None, None)
-            }
-            RouteMode::RagFirst => {
-                emit_phase(&conversation_id, &assistant_message_id, ChatPhase::Retrieving);
-                match retrieve_context_full(
-                    &db,
-                    provider.as_ref(),
-                    &account_id,
-                    &user_question,
-                    &categories,
-                    TOP_K_SOURCES,
-                )
-                .await
-                {
-                    Ok((srcs, trace, embedding)) => {
-                        emit_log(
-                            "info",
-                            &format!(
-                                "retrieve: {} sources (vec={} fts={} fused→{}) [{}ms]",
-                                srcs.len(),
-                                trace.vector_hits,
-                                trace.fts_hits,
-                                trace.fused_top_k,
-                                t_retrieve.elapsed().as_millis()
-                            ),
-                        );
-                        (srcs, Some(trace), embedding)
-                    }
-                    Err(e) => {
-                        emit_log("error", &format!("retrieval error: {}", e));
-                        (Vec::new(), None, None)
-                    }
+    let (sources, retrieval_trace, query_embedding): (
+        Vec<ScoredEmail>,
+        Option<RetrievalTrace>,
+        Option<crate::db::embedding_generations::TypedQueryEmbedding>,
+    ) = match &route.mode {
+        _ if research_active => {
+            emit_log("info", "retrieve: skipped (research mode gathers its own candidates)");
+            (Vec::new(), None, None)
+        }
+        RouteMode::ToolsFirst => {
+            emit_log("info", "retrieve: skipped (ToolsFirst route)");
+            (Vec::new(), None, None)
+        }
+        RouteMode::RagFirst => {
+            emit_phase(&conversation_id, &assistant_message_id, ChatPhase::Retrieving);
+            match retrieve_context_full(
+                &db,
+                provider.as_ref(),
+                &account_id,
+                &user_question,
+                &categories,
+                TOP_K_SOURCES,
+            )
+            .await
+            {
+                Ok((srcs, trace, embedding)) => {
+                    emit_log(
+                        "info",
+                        &format!(
+                            "retrieve: {} sources (vec={} fts={} fused→{}) [{}ms]",
+                            srcs.len(),
+                            trace.vector_hits,
+                            trace.fts_hits,
+                            trace.fused_top_k,
+                            t_retrieve.elapsed().as_millis()
+                        ),
+                    );
+                    (srcs, Some(trace), embedding)
+                }
+                Err(e) => {
+                    emit_log("error", &format!("retrieval error: {}", e));
+                    (Vec::new(), None, None)
                 }
             }
-        };
+        }
+    };
 
     // ── 2b. EmailOps help lookup ─────────────────────────────────────────
     // The bundled guides are a second, separate corpus: a question about the
@@ -5073,7 +5076,7 @@ async fn run_chat_turn_inner(
                 &db,
                 provider.as_ref(),
                 &user_question,
-                query_embedding.as_deref(),
+                query_embedding.as_ref(),
                 ai_language.as_code(),
                 crate::services::help_docs::HELP_TOP_K,
                 help_page.as_deref(),

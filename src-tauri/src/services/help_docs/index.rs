@@ -5,8 +5,8 @@
 //!   - [`ensure_text_index`] — synchronous, cheap: hash the compiled-in
 //!     corpus, and when it differs from the hash stored at the last build,
 //!     replace every row + FTS entry in one transaction.
-//!   - [`ensure_embeddings`] — async: embed every chunk that has no vector
-//!     for the active embedding model, in small batches. Runs on the AI
+//!   - [`ensure_embeddings`] — async: fill missing sources in the frozen
+//!     active generation through `embedding_runtime`. Runs on the AI
 //!     queue from `prewarm_chat` (app) and before a turn in the CLI/evals.
 
 use std::sync::Arc;
@@ -16,23 +16,7 @@ use crate::db::help_docs::PREF_HELP_CORPUS_HASH;
 use crate::db::Database;
 use crate::models::error::Result;
 
-use super::corpus::{corpus, corpus_hash, embedding_text};
-
-/// Chunks embedded per provider call.
-const EMBED_BATCH: usize = 8;
-/// Same default the memory subsystem uses when the preference is unset —
-/// the label only has to be consistent between write and read.
-const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
-
-/// The label vectors are tagged with: the configured embedding model, so a
-/// model switch re-embeds the corpus instead of mixing vector spaces.
-pub fn embedding_model_label(db: &Database) -> String {
-    db.get_preference("ai_embedding_model")
-        .ok()
-        .flatten()
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string())
-}
+use super::corpus::{corpus, corpus_hash};
 
 /// Pure: does the stored index match the compiled-in corpus? A missing hash
 /// or an empty table (a fresh DB, or a migration that recreated the tables)
@@ -70,47 +54,16 @@ fn fts_heading(c: &crate::models::HelpChunk) -> String {
     }
 }
 
-/// Embed every chunk missing a vector for the active model. Best-effort:
-/// a provider failure logs and returns how many were embedded so far, so a
-/// turn can still run FTS-only. Returns the number embedded this call.
-pub async fn ensure_embeddings(db: &Arc<Database>, provider: &dyn AIProvider) -> Result<u32> {
-    let model = embedding_model_label(db);
-    let pending = db.list_help_chunks_needing_embedding(&model, i32::MAX)?;
-    // A provider with no embedding model set up has nothing to embed with;
-    // the text index keeps answering.
-    if pending.is_empty() || !provider.embedding_configured() {
-        return Ok(0);
-    }
-    log(
-        "info",
-        format!("help index: embedding {} guide sections with {model}", pending.len()),
-    );
-    let mut done: u32 = 0;
-    for batch in pending.chunks(EMBED_BATCH) {
-        let texts: Vec<String> = batch.iter().map(|(_, c)| embedding_text(c)).collect();
-        let results = match provider.embed_batch(&texts).await {
-            Ok(r) => r,
-            Err(e) => {
-                log(
-                    "warn",
-                    format!("help index: embedding stopped after {done} sections ({e}); text search still works"),
-                );
-                return Ok(done);
-            }
-        };
-        for ((rowid, chunk), r) in batch.iter().zip(results) {
-            if let Err(e) = db.upsert_help_chunk_embedding(*rowid, &r.embedding, &model) {
-                log(
-                    "warn",
-                    format!("help index: could not store the vector for {} ({e})", chunk.chunk_id),
-                );
-                continue;
-            }
-            done += 1;
-        }
-    }
-    log("success", format!("help index: {done} guide sections embedded"));
-    Ok(done)
+/// Fill missing help sources in the verified active generation. An unbuilt
+/// index stays on text search without making provider requests.
+pub async fn ensure_embeddings(db: &Arc<Database>, _provider: &dyn AIProvider) -> Result<u32> {
+    super::super::embedding_runtime::update_active(
+        db,
+        crate::db::embedding_generations::Corpus::HelpDocs,
+        None,
+        usize::MAX,
+    )
+    .await
 }
 
 /// Text index first (synchronous), then vectors. The one call the app's
@@ -170,14 +123,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn embedding_label_falls_back_to_default() {
-        let db = Database::new_for_testing().unwrap();
-        assert_eq!(embedding_model_label(&db), DEFAULT_EMBEDDING_MODEL);
-        db.set_preference("ai_embedding_model", "bge-m3").unwrap();
-        assert_eq!(embedding_model_label(&db), "bge-m3");
-    }
-
     #[tokio::test]
     async fn ensure_embeddings_asks_nothing_of_a_provider_without_an_embedding_model() {
         use crate::ai::provider::FakeAiProvider;
@@ -191,22 +136,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_embeddings_fills_every_chunk_with_the_fake_provider() {
+    async fn unverified_legacy_help_never_sends_inference() {
         use crate::ai::provider::FakeAiProvider;
         let db = Arc::new(Database::new_for_testing().unwrap());
         ensure_text_index(&db).unwrap();
-        let provider = FakeAiProvider::default().with_embedding_dim(768);
-        let n = ensure_embeddings(&db, &provider).await.unwrap();
-        assert_eq!(n as usize, corpus().len());
-        assert_eq!(
-            ensure_embeddings(&db, &provider).await.unwrap(),
-            0,
-            "second run is a no-op"
-        );
-        let model = embedding_model_label(&db);
-        assert_eq!(
-            db.count_help_chunks_embedded_with(&model).unwrap() as usize,
-            corpus().len()
-        );
+        let provider = FakeAiProvider::default().with_embedding_dim(4096);
+        assert_eq!(ensure_embeddings(&db, &provider).await.unwrap(), 0);
+        assert!(provider.embed_calls().is_empty());
     }
 }

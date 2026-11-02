@@ -35,3 +35,13 @@ Files:
 - Chat conversation management — that is `services/chat`
 - Task list UI (frontend) — that is `src/components/Memory/`
 - Email sync — that is `services/emails`
+
+## Managed embedding generations
+
+Fact indexing delegates to `embedding_runtime::update_active` with `MemoryFacts`.
+It uses the active immutable profile, current opt-in consent and source revision,
+never the mutable `ai_embedding_model` preference. Missing/unverified generations
+send no requests. Fact semantic recall calls `embed_query_for(MemoryFacts, ...)`
+and uses typed generation retrieval with account and retirement filters before
+KNN top-K; failures retain the existing FTS/RRF path. Initial replacements build
+with email/help and activate together. Memory is off by default.

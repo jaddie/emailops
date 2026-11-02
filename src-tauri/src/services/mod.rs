@@ -18,6 +18,8 @@ pub mod dashboard;
 pub mod data_move;
 pub mod email_company;
 pub mod emails;
+pub mod embedding_runtime;
+pub mod embedding_session;
 pub mod embeddings;
 pub mod events;
 pub mod filters;

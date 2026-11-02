@@ -55,7 +55,8 @@ pub fn fetch_fts(db: &Database, req: FtsRequest<'_>) -> Result<Vec<(String, f64)
 /// Inputs for a vector KNN fetch.
 pub struct VectorRequest<'a> {
     pub account_id: &'a str,
-    pub embedding: &'a [f32],
+    pub embedding: &'a crate::db::embedding_generations::TypedQueryEmbedding,
+    pub exact_input: &'a str,
     pub categories: Option<&'a [String]>,
     pub limit: usize,
 }
@@ -64,5 +65,17 @@ pub struct VectorRequest<'a> {
 /// better — `db.vec_search` already converts the underlying distance into a
 /// similarity score and dedupes by email_id.
 pub fn fetch_vector(db: &Database, req: VectorRequest<'_>) -> Result<Vec<(String, f32)>> {
-    db.vec_search(req.embedding, Some(req.account_id), req.categories, req.limit)
+    Ok(db
+        .search_generation_vectors(
+            req.embedding,
+            req.exact_input,
+            crate::db::embedding_generations::Corpus::Emails,
+            Some(req.account_id),
+            req.categories.unwrap_or_default(),
+            None,
+            req.limit,
+        )?
+        .into_iter()
+        .map(|h| (h.source_id, h.similarity))
+        .collect())
 }

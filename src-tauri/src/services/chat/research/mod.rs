@@ -456,12 +456,13 @@ async fn gather_semantic(input: &PrepareInput<'_>, query: &str, keywords: Option
     let mut ids = Vec::new();
     // With no embedding model set up there is no vector index to ask; the
     // keyword hits below are the whole pool.
-    if input.provider.embedding_configured() {
-        match input.provider.embed(query).await {
-            Ok(emb) => {
+    {
+        match crate::services::embedding_runtime::embed_query(input.db, query).await {
+            Ok(Some(emb)) => {
                 let req = crate::services::retrieval::VectorRequest {
                     account_id: input.account_id,
-                    embedding: &emb.embedding,
+                    embedding: &emb,
+                    exact_input: query,
                     categories,
                     limit: SEMANTIC_POOL,
                 };
@@ -475,6 +476,7 @@ async fn gather_semantic(input: &PrepareInput<'_>, query: &str, keywords: Option
                     Err(e) => super::emit_log("error", &format!("research: vector search failed: {e}")),
                 }
             }
+            Ok(None) => {}
             Err(e) => super::emit_log("error", &format!("research: embedding the question failed: {e}")),
         }
     }

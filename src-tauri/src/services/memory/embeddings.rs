@@ -11,79 +11,20 @@ use crate::services::app_handle::AppHandle;
 use crate::db::Database;
 use crate::models::error::Result;
 use crate::models::MemoryFact;
-use crate::services::ai::AiService;
 
-const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
 const MAX_BATCH: i32 = 64;
 
 /// Embed up to `MAX_BATCH` candidate facts for `account_id` that don't yet
 /// have an embedding row. Best-effort: provider failures log and return the
 /// count successfully embedded so far.
-pub async fn embed_pending_facts(db: &Arc<Database>, app: &AppHandle, account_id: &str) -> Result<u32> {
-    let rows = db.list_facts_needing_embedding(account_id, MAX_BATCH)?;
-    if rows.is_empty() {
-        return Ok(0);
-    }
-
-    let ai = match AiService::new(db.clone()) {
-        Ok(svc) => svc,
-        Err(e) => {
-            emit_log(
-                app,
-                "warn",
-                "memory",
-                &format!("fact embedding disabled (no AI provider): {e}"),
-            );
-            return Ok(0);
-        }
-    };
-
-    // No embedding model set up (OpenRouter before one is chosen): facts stay
-    // pending and keyword search keeps finding them.
-    if !ai.provider().embedding_configured() {
-        return Ok(0);
-    }
-
-    let model = db
-        .get_preference("ai_embedding_model")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
-
-    emit_log(app, "info", "memory", &format!("Embedding {} memory facts", rows.len()));
-
-    let mut ok: u32 = 0;
-    for (fact_id, text) in &rows {
-        // Stopped from the queue because the AI provider is about to change:
-        // the facts left stay pending for the next run.
-        if crate::services::task_queue::cancel_requested() {
-            break;
-        }
-        match ai.embed(text).await {
-            Ok(vec) => {
-                if let Err(e) = db.upsert_fact_embedding(fact_id, &vec, &model) {
-                    emit_log(
-                        app,
-                        "warn",
-                        "memory",
-                        &format!("upsert_fact_embedding failed for {fact_id}: {e}"),
-                    );
-                } else {
-                    ok += 1;
-                }
-            }
-            Err(e) => {
-                emit_log(app, "warn", "memory", &format!("embed failed for {fact_id}: {e}"));
-            }
-        }
-    }
-    emit_log(
-        app,
-        "success",
-        "memory",
-        &format!("Embedded {}/{} facts", ok, rows.len()),
-    );
-    Ok(ok)
+pub async fn embed_pending_facts(db: &Arc<Database>, _app: &AppHandle, account_id: &str) -> Result<u32> {
+    crate::services::embedding_runtime::update_active(
+        db,
+        crate::db::embedding_generations::Corpus::MemoryFacts,
+        Some(account_id),
+        MAX_BATCH as usize,
+    )
+    .await
 }
 
 /// Hybrid search over facts: vector KNN + FTS5, fused via RRF. Mirrors the
@@ -106,14 +47,50 @@ pub async fn hybrid_search_facts(
 
     // Vector path — optional (requires embedding provider).
     let vec_hits: Vec<(MemoryFact, f32)> = if app.is_some() {
-        match AiService::new(db.clone()) {
-            Ok(ai) => match ai.embed(query).await {
-                Ok(v) => db
-                    .vec_search_memory_facts(&v, account_id, limit as i32 * 2)
-                    .unwrap_or_default(),
-                Err(_) => Vec::new(),
+        match crate::services::embedding_runtime::embed_query_for(
+            db,
+            crate::db::embedding_generations::Corpus::MemoryFacts,
+            query,
+        )
+        .await
+        {
+            Ok(Some(embedding)) => match db.search_generation_vectors(
+                &embedding,
+                query,
+                crate::db::embedding_generations::Corpus::MemoryFacts,
+                Some(account_id),
+                &[],
+                None,
+                limit * 2,
+            ) {
+                Ok(hits) => {
+                    let ids: Vec<String> = hits.iter().map(|h| h.source_id.clone()).collect();
+                    db.managed_memory_facts(&ids, account_id)?
+                        .into_iter()
+                        .filter_map(|fact| {
+                            let score = hits.iter().find(|h| h.source_id == fact.id)?.similarity;
+                            Some((fact, score))
+                        })
+                        .collect()
+                }
+                Err(error) => {
+                    crate::services::logger::log(
+                        "warn",
+                        "memory",
+                        format!("Managed fact retrieval unavailable: {error}; using text search"),
+                    );
+                    Vec::new()
+                }
             },
-            Err(_) => Vec::new(),
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                crate::services::logger::log(
+                    "warn",
+                    "memory",
+                    format!("Managed fact query unavailable: {error}; using text search"),
+                );
+                Vec::new()
+            }
         }
     } else {
         Vec::new()
@@ -148,10 +125,6 @@ fn rrf_fuse(fts: Vec<(MemoryFact, f64)>, vec: Vec<(MemoryFact, f32)>, limit: usi
     out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     out.truncate(limit);
     out.into_iter().map(|(f, _)| f).collect()
-}
-
-fn emit_log(_app: &AppHandle, level: &str, source: &str, message: &str) {
-    crate::services::logger::log(level, source, message);
 }
 
 #[cfg(test)]

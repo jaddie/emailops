@@ -813,57 +813,29 @@ async fn get_vector_scores(
     query: &str,
     categories: Option<&[String]>,
 ) -> Result<Vec<(String, f32)>> {
-    // Generate embedding for the search query (Ollama HTTP call)
-    let t = std::time::Instant::now();
-    let query_embedding = match ollama.generate_embedding(query).await {
-        Ok(emb) => emb,
-        Err(e) => {
+    let _ = ollama; // SearchBar keeps its existing FTS-only flag.
+    match crate::services::embedding_runtime::embed_query(db, query).await {
+        Ok(Some(embedding)) => fetch_vector(
+            db,
+            VectorRequest {
+                account_id,
+                embedding: &embedding,
+                exact_input: query,
+                categories,
+                limit: 150,
+            },
+        ),
+        Ok(None) => Ok(Vec::new()),
+        Err(error) => {
             emit_log(
                 &None,
                 "debug",
                 "search",
-                &format!(
-                    "[timing] ollama.generate_embedding: {:.0}ms (FAILED: {})",
-                    t.elapsed().as_secs_f64() * 1000.0,
-                    e,
-                ),
+                &format!("Managed vector search unavailable: {error}; using text search"),
             );
-            return Ok(Vec::new());
+            Ok(Vec::new())
         }
-    };
-    emit_log(
-        &None,
-        "debug",
-        "search",
-        &format!(
-            "[timing] ollama.generate_embedding: {:.0}ms (dim={})",
-            t.elapsed().as_secs_f64() * 1000.0,
-            query_embedding.len(),
-        ),
-    );
-
-    // KNN search via sqlite-vec (returns deduplicated email_id, similarity pairs)
-    let t = std::time::Instant::now();
-    let result = fetch_vector(
-        db,
-        VectorRequest {
-            account_id,
-            embedding: &query_embedding,
-            categories,
-            limit: 150,
-        },
-    );
-    emit_log(
-        &None,
-        "debug",
-        "search",
-        &format!(
-            "[timing] vec_search (KNN): {:.0}ms ({} hits)",
-            t.elapsed().as_secs_f64() * 1000.0,
-            result.as_ref().map(|v| v.len()).unwrap_or(0),
-        ),
-    );
-    result
+    }
 }
 
 /// Get FTS search scores

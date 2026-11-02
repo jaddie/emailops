@@ -1,26 +1,34 @@
 # services/retrieval
 
-## What this module owns
+Shared FTS candidate fetches, typed managed vector fetches, Reciprocal Rank
+Fusion and thread deduplication. Chat, draft precedent search, agent search and
+research use the same managed embedding identity; SearchBar keeps its existing
+FTS-only switch.
 
-Hybrid retrieval combining FTS5 keyword search and sqlite-vec vector similarity search, fused with Reciprocal Rank Fusion (RRF).
+`fetch_fts(db, FtsRequest)` works without AI. `fetch_vector(db, VectorRequest)`
+requires a `TypedQueryEmbedding` plus its exact formatted input; raw float slices
+are not accepted. The database rechecks the active generation, profile, dimensions,
+format and input hash on one reader snapshot. Its vec0 `rowid IN` subquery applies
+account, generation scope, category, current source revision and eligibility
+before KNN's candidate budget, and maps vector rows to source IDs in that snapshot.
 
-- **mod.rs** — `retrieve(db, query, account_id, top_k) -> Result<Vec<RetrievedEmail>>` — the single entry point for all search-backed features (chat, agent search, filter suggestions)
-- **rrf.rs** — pure Reciprocal Rank Fusion: `rrf(vector_hits, fts_hits, k) -> Vec<RankedEmail>`. No I/O — unit-testable with lists of email IDs.
-- **dedup.rs** — thread-level deduplication: collapses multiple emails from the same thread into one representative result
+`services/embedding_runtime::embed_query` creates query vectors through a frozen
+active-profile session, rechecks the active pointer after inference, and returns
+`None` without any provider call when no verified active index exists. Provider
+errors, stale activation/configuration and missing indexes fall back to FTS at
+call sites. Help reuses a typed query only when its exact input also matches;
+rewritten mailbox questions otherwise require their own help query.
 
-## Dependencies
+`services/embedding_runtime` owns revision-checked preview/commit, explicit
+resume/re-probe and rollback, cross-corpus builds, per-request authorization,
+source snapshots, cancellation and leases. `db/embedding_generations` owns
+transactions and atomic activation. Keep prompts, chat assembly and frontend
+lifecycle presentation in their existing owning modules.
 
-- `db/emails/search.rs` — FTS5 query execution
-- `db/embeddings.rs` — nearest-neighbour vector queries via sqlite-vec
-- `services/embeddings` — on-demand embedding for the query string
-
-## Public surface
-
-- `retrieve(db, query, account_id, k, embedding_model) -> Result<Vec<RetrievedEmail>>`
-- `rrf::fuse(vector: &[RankedId], fts: &[RankedId], k: usize) -> Vec<RankedId>` (pure)
-
-## What should NOT live here
-
-- Chat message assembly — that is `services/chat`
-- Embedding generation for emails — that is `services/embeddings`
-- Filter suggestion logic — that is `services/filters`
+Settings changes enter through `embedding_runtime::preview_settings_build` and
+`commit_settings_build`, passing proposed `AiSettingsInput`, dimension policy and
+the returned preview. They validate unsaved configuration, stage versioned
+credentials, then atomically publish preference writes plus the candidate job.
+`preview_build`/`commit_build` remain the lower-level profile-only path when the
+trusted provider settings already exist. See the database module's commit-boundary
+and orphan-secret rules; frontend code must not compose separate save/rebuild calls.

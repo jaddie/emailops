@@ -9,12 +9,11 @@ use chrono::Utc;
 use tokio::time::timeout;
 
 use crate::ai::provider::AIProvider;
+use crate::db::embedding_generations::{Corpus, TypedQueryEmbedding};
 use crate::db::Database;
 use crate::models::error::Result;
 use crate::models::{Email, RetrievalTrace};
-use crate::services::retrieval::{
-    dedup_by_thread, fetch_fts, fetch_vector, fuse_rrf, FtsRequest, Ranking, VectorRequest,
-};
+use crate::services::retrieval::{dedup_by_thread, fetch_fts, fuse_rrf, FtsRequest, Ranking};
 use crate::util::html::strip_html_for_fts;
 
 use super::emit_log;
@@ -266,7 +265,7 @@ pub async fn retrieve_context_full(
     query: &str,
     categories: &[String],
     k: usize,
-) -> Result<(Vec<ScoredEmail>, RetrievalTrace, Option<Vec<f32>>)> {
+) -> Result<(Vec<ScoredEmail>, RetrievalTrace, Option<TypedQueryEmbedding>)> {
     let t_total = std::time::Instant::now();
     let cat_filter = db_category_filter(categories);
 
@@ -318,26 +317,35 @@ pub async fn retrieve_context_full(
     let mut vec_search_ms: Option<i64> = None;
     let vec_fut = async {
         let t_emb = std::time::Instant::now();
-        let emb = provider.embed(effective_query).await?.embedding;
+        let emb = crate::services::embedding_runtime::embed_query(db, effective_query).await?;
         let emb_ms = t_emb.elapsed().as_millis() as i64;
         let t_vs = std::time::Instant::now();
-        let scores = fetch_vector(
-            db,
-            VectorRequest {
-                account_id,
-                embedding: &emb,
-                categories: cat_filter,
-                limit: VEC_CANDIDATES,
-            },
-        )?;
+        let scores = match &emb {
+            Some(query) => db
+                .search_generation_vectors(
+                    query,
+                    effective_query,
+                    Corpus::Emails,
+                    Some(account_id),
+                    categories,
+                    None,
+                    VEC_CANDIDATES,
+                )?
+                .into_iter()
+                .map(|h| (h.source_id, h.similarity))
+                .collect(),
+            None => Vec::new(),
+        };
         let vs_ms = t_vs.elapsed().as_millis() as i64;
-        Ok::<(Vec<(String, f32)>, i64, i64, Vec<f32>), crate::models::error::AppError>((scores, emb_ms, vs_ms, emb))
+        Ok::<_, crate::models::error::AppError>((scores, emb_ms, vs_ms, emb))
     };
-    let mut query_embedding: Option<Vec<f32>> = None;
-    let vector_scores: Vec<(String, f32)> = if !provider.embedding_configured() {
-        // No embedding model is set up (OpenRouter before one is chosen):
-        // nothing to ask, keyword search alone answers.
-        emit_log("debug", "no embedding model is set up; keyword search only");
+    let mut query_embedding: Option<TypedQueryEmbedding> = None;
+    let vector_scores: Vec<(String, f32)> = if db.active_embedding_write_lease()?.is_none() {
+        // Unverified/legacy indexes must not trigger query inference.
+        emit_log(
+            "debug",
+            "no verified active embedding index; build a replacement in Settings; keyword search only",
+        );
         vector_fallback = true;
         Vec::new()
     } else {
@@ -345,7 +353,7 @@ pub async fn retrieve_context_full(
             Ok(Ok((scores, emb_ms, vs_ms, emb))) => {
                 embedding_ms = Some(emb_ms);
                 vec_search_ms = Some(vs_ms);
-                query_embedding = Some(emb);
+                query_embedding = emb;
                 scores
             }
             Ok(Err(e)) => {

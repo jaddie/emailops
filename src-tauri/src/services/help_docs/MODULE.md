@@ -16,7 +16,9 @@ an answer cites a guide section.
   is the table of contents the chat query planner picks a page from.
 - **index.rs** — planner + executor. `ensure_text_index` rebuilds `help_doc_chunks` +
   `help_docs_fts` when the corpus hash changed (synchronous, cheap); `ensure_embeddings`
-  fills `vec_help_docs` for the active embedding model in batches (async, best-effort).
+  fills the active managed generation through `embedding_runtime` (async). No
+  inference runs for legacy/unverified indexes. Initial/replacement builds join
+  email and memory activation; the text index remains independently available.
 - **retrieval.rs** — `lookup_help` fetches FTS + KNN candidates, fuses them with the shared
   RRF, and the pure `plan_help_sources` collapses to one source per section, gates on
   vector similarity (`HELP_MIN_SIMILARITY`, overridable with `chat.help_min_similarity`)
@@ -35,7 +37,9 @@ an answer cites a guide section.
 
 - `db/help_docs.rs` — all SQL (rebuild, embedding upsert, FTS/KNN fetch, sibling lookup)
 - `services/retrieval` — `fuse_rrf`
-- `ai/provider.rs` — `AIProvider::embed` / `embed_batch`
+- `services/embedding_runtime` — frozen active-profile sessions and typed query
+  identity. Every request checks current help consent, master AI and credentials.
+  Help KNN uses a prefiltered managed generation, never a mutable model label.
 - `services/chat/turn.rs` is the only caller: lookup after mailbox retrieval, block
   prepended to the final user message, `ToolEffect::NavigateTo` after the answer. It
   decides whether to look up at all (`help_lookup_wanted`): never on a turn about the open
@@ -46,7 +50,9 @@ an answer cites a guide section.
 
 - `ensure_index(db, provider)` / `ensure_text_index(db)` / `ensure_embeddings(db, provider)`
 - `lookup_help(db, provider, query, query_embedding, ui_lang, k, page) -> (Vec<HelpSource>, HelpTrace)`
-  — `page` is the guide page from the planner's `{"app_help": "<page>"}` verdict
+  — `query_embedding` is `Option<&TypedQueryEmbedding>`; it is reused only
+  for identical exact input and active-profile identity. Errors use FTS.
+  `page` is the guide page from the planner's `{"app_help": "<page>"}` verdict
 - `render_help_block(&[HelpSource], app_help: bool) -> Option<String>` — `app_help` is the
   query planner's verdict that the question is about EmailOps; the block then instructs
   unconditionally instead of asking the model to judge whether it applies

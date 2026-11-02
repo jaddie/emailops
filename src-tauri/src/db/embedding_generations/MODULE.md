@@ -4,8 +4,9 @@ This module owns additive V041 storage and index lifecycle. It has no provider,
 network, Tauri or UI dependency. Existing fixed-name vectors and metadata remain
 legacy generation zero, preserved and unverified. Public legacy vector searches
 return no candidates; FTS remains available. Legacy writers cannot populate a
-managed generation. Stage 2 is a development checkpoint, not a standalone release:
-provider request suppression and managed retrieval arrive in Stage 3.
+managed generation. Managed service execution now uses `services/embedding_runtime` and frozen
+`embedding_session` providers. Legacy installations send no semantic inference
+until an explicitly requested verified replacement is built.
 
 ## Invariants
 
@@ -91,3 +92,59 @@ Use the frozen active profile, not mutable legacy provider preferences, for both
 query and document sessions. Stage 3 owns dimension probing/native-policy UI
 contracts, malformed provider response association, provider/network errors and
 retrieval/eval behavior. Stage 4 owns commands/settings/progress presentation.
+
+## Stage 3 runtime boundary
+
+`embedding_source_snapshots` reads content and its source revision together in
+one transaction. `embedding_build_is_current` / `embedding_source_is_current`
+fence requests before I/O, while the existing write transaction fences results.
+`TypedQueryEmbedding::new` binds the active lease/profile, full exact query input
+hash, query format and validated vector. `search_generation_vectors` requires
+that exact input and checks the active pointer/configuration/profile in the same
+reader snapshot as vec0 KNN and vector-row mapping. Eligible rowids are passed to
+vec0 before top-K; filters include account, category, source revision, scope,
+retirement, mailbox/junk/account eligibility and live feature gates. It never
+falls back to legacy vectors. Pinned-extension tests place 24 closer excluded
+neighbours ahead of one eligible neighbour to verify filtering precedes top-K.
+
+Candidate creation, rollback preparation and discard carry a current active
+scope forward across their lifecycle-only revision bump. A scope already stale
+from a real settings change remains stale. This preserves active retrieval while
+its replacement builds without blessing outdated account/category policy.
+V042 adds detected-dimension metadata to the settings revision fence. Memory scope
+matches the actual opt-in default (`false`); help remains on by default.
+
+## Proposed settings and candidate commit
+
+The settings UI uses `embedding_runtime::preview_settings_build(db, input,
+policy, corpora)` and `commit_settings_build(db, input, policy, preview)`, followed
+by a queued `run_build` with the returned lease. It never saves settings and then
+independently asks for a rebuild. Preview validates the proposed endpoint,
+disclosure, key change, source and model; only fixed neutral text is sent, with
+no published settings or key references. Commit repeats validation/probing,
+preserves and checks the preview's opaque observation identity, binds proposed
+non-secret settings, and rechecks the optimistic revision.
+
+`prepare_embedding_generation_with_preferences` publishes all planned settings,
+current credential references, candidate profile, vector tables and durable job
+inside one top-level SQLite transaction. A failed fence, settings write, DDL or
+job insert rolls everything back. Active profile/pointer/vector rows are not
+rewritten. A changed destination may temporarily make that old profile unavailable
+until activation; it never acquires the new configuration by relabelling.
+
+The OS vault cannot join a SQLite transaction. Release builds stage new secrets
+under fresh UUID references before the transaction; staging never overwrites or
+deletes the currently referenced key. A failed DB commit can leave an unreachable
+vault entry, which grants no authority and is never resolved by retained profiles.
+Debug key values and their references are written within the same SQLite
+transaction. Current credential references are always resolved live; profile and
+rollback metadata contain none. Clearing a reference revokes authority even if an
+old vault entry remains. Legacy fixed references remain readable.
+
+Rollback to a different previously configured endpoint is intentionally refused
+until that destination/source is explicitly selected and authorized again with
+current disclosure/key settings. The backend returns an actionable authorization
+message; Stage 4 must display it rather than present a generic rebuild failure.
+Retained profiles never restore old consent or credential references implicitly.
+Same-destination model/dimension rollback verifies the retained neutral baseline
+with current credentials, catches up sources and uses ordinary validation/activation.

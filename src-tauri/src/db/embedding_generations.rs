@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 use super::Database;
 use crate::models::error::{AppError, Result};
 
+mod runtime;
+pub use runtime::{
+    EmbeddingSourceSnapshot, GenerationCorpusStatus, GenerationVectorHit, SourceContent, TypedQueryEmbedding,
+};
+
 const LEASE_SECONDS: i64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +206,14 @@ fn control(conn: &Connection) -> Result<GenerationControl> {
     )?)
 }
 
+/// Lifecycle metadata changes do not change source selection. Preserve an
+/// already-current active scope while fencing in-flight work at the new revision.
+/// A scope stale from real settings changes deliberately stays stale.
+fn carry_active_scope(conn: &Connection, previous_revision: i64) -> Result<()> {
+    conn.execute("UPDATE embedding_generations SET scope_revision=(SELECT revision FROM embedding_control) WHERE id=(SELECT active_id FROM embedding_control) AND scope_revision=?1",[previous_revision])?;
+    Ok(())
+}
+
 fn check_lease(conn: &Connection, lease: &BuildLease) -> Result<usize> {
     let dimensions: Option<usize> = conn
         .query_row(
@@ -240,7 +253,9 @@ fn snapshot_email_scope(conn: &Connection, generation: i64) -> Result<()> {
         (Corpus::MemoryFacts, "memory_enabled"),
         (Corpus::HelpDocs, "help_docs_enabled"),
     ] {
-        let enabled = preference(key)?.map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(true);
+        let enabled = preference(key)?
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(corpus != Corpus::MemoryFacts);
         conn.execute("UPDATE embedding_generation_corpora SET enabled=requested_enabled AND ?3 WHERE generation_id=?1 AND corpus=?2",params![generation,corpus.as_str(),enabled])?;
     }
     let days = preference("ai_max_email_age_days")?
@@ -462,6 +477,20 @@ impl Database {
         enabled_corpora: &[Corpus],
         expected_revision: i64,
     ) -> Result<BuildLease> {
+        self.prepare_embedding_generation_with_preferences(profile, enabled_corpora, expected_revision, &[])
+    }
+
+    /// The settings/candidate commit boundary. Validated service plans stage
+    /// versioned credentials first, then publish their references and every
+    /// proposed setting together with the replacement generation in this one
+    /// top-level SQLite transaction. No network or keychain operation runs here.
+    pub fn prepare_embedding_generation_with_preferences(
+        &self,
+        profile: &EmbeddingProfile,
+        enabled_corpora: &[Corpus],
+        expected_revision: i64,
+        preferences: &[(String, Option<String>)],
+    ) -> Result<BuildLease> {
         let profile = profile.canonicalized()?;
         let fingerprint = profile.fingerprint()?;
         let owner = uuid::Uuid::new_v4().to_string();
@@ -471,7 +500,18 @@ impl Database {
         if current.revision != expected_revision || current.pending_id.is_some() {
             return invalid("Embedding configuration changed or another build is pending");
         }
-        let revision = current.revision + 1;
+        for (key, value) in preferences {
+            match value {
+                Some(value) => {
+                    tx.execute("INSERT INTO user_preferences(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value IS NOT excluded.value",params![key,value])?;
+                }
+                None => {
+                    tx.execute("DELETE FROM user_preferences WHERE key=?1", [key])?;
+                }
+            }
+        }
+        let prepared_revision = control(&tx)?.revision;
+        let revision = prepared_revision + 1;
         tx.execute(
             "INSERT INTO embedding_generations(profile_json,fingerprint,dimensions,state,epoch,owner,lease_until,config_revision,created_at)
              VALUES(?1,?2,?3,'preparing',1,?4,?5,?6,?7)",
@@ -494,6 +534,25 @@ impl Database {
             "UPDATE embedding_control SET revision=?1,pending_id=?2 WHERE singleton=1",
             params![revision, generation],
         )?;
+        if !preferences.is_empty() {
+            if let Some(active) = current.active_id {
+                let healthy: bool = tx.query_row(
+                    "SELECT state='active' FROM embedding_generations WHERE id=?1",
+                    [active],
+                    |r| r.get(0),
+                )?;
+                if healthy {
+                    // This explicit combined settings operation refreshes current
+                    // selection/consent without relabelling the active vectors.
+                    // Same-destination model/dimension replacements can therefore
+                    // continue querying the previous immutable profile while built.
+                    snapshot_email_scope(&tx, active)?;
+                    tx.execute("UPDATE embedding_generations SET scope_revision=?2,mutation_version=mutation_version+1,validation_json=NULL WHERE id=?1",params![active,revision])?;
+                }
+            }
+        } else {
+            carry_active_scope(&tx, prepared_revision)?;
+        }
         tx.commit()?;
         Ok(BuildLease {
             generation_id: generation,
@@ -801,6 +860,7 @@ impl Database {
             "UPDATE embedding_control SET pending_id=?1,retained_id=NULL,revision=?2",
             params![generation, revision],
         )?;
+        carry_active_scope(&tx, current.revision)?;
         tx.commit()?;
         Ok(BuildLease {
             generation_id: generation,
@@ -818,7 +878,8 @@ impl Database {
         }
         let mut conn = self.connection();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if control(&tx)?.active_id == Some(generation) {
+        let current = control(&tx)?;
+        if current.active_id == Some(generation) {
             return invalid("Cannot discard the active embedding generation");
         }
         let state: String = tx.query_row(
@@ -836,6 +897,7 @@ impl Database {
             ))?;
         }
         tx.execute("UPDATE embedding_control SET pending_id=CASE WHEN pending_id=?1 THEN NULL ELSE pending_id END,retained_id=CASE WHEN retained_id=?1 THEN NULL ELSE retained_id END,revision=revision+1", [generation])?;
+        carry_active_scope(&tx, current.revision)?;
         tx.execute("DELETE FROM embedding_generations WHERE id=?1", [generation])?;
         tx.commit()?;
         Ok(())

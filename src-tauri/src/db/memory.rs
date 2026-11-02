@@ -26,7 +26,7 @@ const PIPELINE_TASKS: &str = "tasks";
 
 // ── Row helpers ──────────────────────────────────────────────────────────────
 
-fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<MemoryFact> {
+pub(crate) fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<MemoryFact> {
     Ok(MemoryFact {
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -47,7 +47,7 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<MemoryFact> {
     })
 }
 
-const FACT_SELECT: &str = "SELECT id, account_id, subject_kind, subject_key, fact,
+pub(crate) const FACT_SELECT: &str = "SELECT id, account_id, subject_kind, subject_key, fact,
                                   source, source_email_id, confidence, score, status,
                                   last_used_at, domain, vigency, company, created_at, updated_at
                            FROM memory_facts";

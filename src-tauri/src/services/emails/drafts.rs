@@ -465,12 +465,16 @@ pub async fn generate_new_draft(
 /// For each surviving thread we prefer the user's own reply (best precedent
 /// of voice) and fall back to the latest message in that thread otherwise.
 async fn retrieve_rag_sources(db: &Arc<Database>, email: &Email, user_email: &str) -> Result<Vec<DraftSource>> {
-    let ai = AiService::new(db.clone())?;
-
     let embed_text = format!("{}\n{}", email.subject, truncate_utf8(&email.snippet, 2000));
     emit_log("info", "retrieving similar threads…");
 
-    let query_vec = ai.embed(&embed_text).await?;
+    let query_vec = match crate::services::embedding_runtime::embed_query(db, &embed_text).await {
+        Ok(embedding) => embedding,
+        Err(error) => {
+            emit_log("warn", &format!("Draft retrieval: {error}; using text search"));
+            None
+        }
+    };
     let fts_query = build_fts_query(&email.subject, &email.snippet);
 
     let fts_hits = fetch_fts(
@@ -484,16 +488,20 @@ async fn retrieve_rag_sources(db: &Arc<Database>, email: &Email, user_email: &st
         },
     )
     .unwrap_or_default();
-    let vec_hits = fetch_vector(
-        db,
-        VectorRequest {
-            account_id: &email.account_id,
-            embedding: &query_vec,
-            categories: None,
-            limit: RAG_POOL_SIZE,
-        },
-    )
-    .unwrap_or_default();
+    let vec_hits = match &query_vec {
+        Some(embedding) => fetch_vector(
+            db,
+            VectorRequest {
+                account_id: &email.account_id,
+                embedding,
+                exact_input: &embed_text,
+                categories: None,
+                limit: RAG_POOL_SIZE,
+            },
+        )
+        .unwrap_or_default(),
+        None => Vec::new(),
+    };
 
     let fts_ids: Vec<String> = fts_hits.iter().map(|(id, _)| id.clone()).collect();
     let vec_ids: Vec<String> = vec_hits.iter().map(|(id, _)| id.clone()).collect();

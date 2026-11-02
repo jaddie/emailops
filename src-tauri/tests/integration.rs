@@ -6223,7 +6223,7 @@ async fn an_inbox_burst_larger_than_the_incremental_cap_is_completed_by_later_sy
 /// Ids a query retrieves for `acc-ret` through both candidate fetches the
 /// chat, search and agent search share: `(keyword, vector)`.
 fn retrieved_ids(db: &Database) -> (Vec<String>, Vec<String>) {
-    use emailops_lib::services::retrieval::{fetch_fts, fetch_vector, FtsRequest, VectorRequest};
+    use emailops_lib::services::retrieval::{fetch_fts, FtsRequest};
     let mut keyword: Vec<String> = fetch_fts(
         db,
         FtsRequest {
@@ -6238,19 +6238,14 @@ fn retrieved_ids(db: &Database) -> (Vec<String>, Vec<String>) {
     .into_iter()
     .map(|(id, _)| id)
     .collect();
-    let mut vector: Vec<String> = fetch_vector(
-        db,
-        VectorRequest {
-            account_id: "acc-ret",
-            embedding: &[0.1_f32; 768],
-            categories: None,
-            limit: 10,
-        },
-    )
-    .expect("vector")
-    .into_iter()
-    .map(|(id, _)| id)
-    .collect();
+    // This fixture deliberately tests preserved UNVERIFIED legacy bytes. They
+    // must remain guarded; raw vectors cannot enter the managed fetch boundary.
+    let mut vector: Vec<String> = db
+        .vec_search(&[0.1_f32; 768], Some("acc-ret"), None, 10)
+        .expect("vector")
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     keyword.sort();
     vector.sort();
     (keyword, vector)
@@ -6296,6 +6291,115 @@ async fn retrieval_leaves_out_trashed_and_junk_marked_messages() {
         retrieved_ids(&db),
         (restored, Vec::new()),
         "un-junk restores keyword access; trashed mail and legacy semantic hits remain excluded"
+    );
+}
+
+/// The production candidate-fetch seam accepts a typed, active identity and
+/// must enforce live privacy after indexing, including cached query reuse.
+#[tokio::test]
+async fn managed_retrieval_leaves_out_trashed_and_junk_marked_messages() {
+    use emailops_lib::db::embedding_generations::{Corpus, DimensionPolicy, EmbeddingProfile, TypedQueryEmbedding};
+    use emailops_lib::services::retrieval::{fetch_vector, VectorRequest};
+    let db = test_db();
+    db.insert_account(&make_account("acc-ret", "managed-ret@example.test"))
+        .unwrap();
+    for (id, timestamp) in [("r-junk", 1000), ("r-live", 3000), ("r-trashed", 2000)] {
+        let mut email = make_email(id, "acc-ret", timestamp);
+        email.subject = format!("Quarterly forecast {id}");
+        db.insert_email(&email).unwrap();
+    }
+    let profile = EmbeddingProfile {
+        version: 1,
+        backend: "synthetic".into(),
+        endpoint: None,
+        model: "fixture4096".into(),
+        model_revision: Some("fixture-v1".into()),
+        dimension_policy: DimensionPolicy::Native,
+        dimensions: 4096,
+        query_format: "raw-query-v1".into(),
+        document_format: "emailops-documents-v1".into(),
+        preprocessing: "emailops-chunk-v1".into(),
+        normalization: "none".into(),
+        encoding: "float32-le".into(),
+        distance_metric: "cosine".into(),
+    };
+    let lease = db
+        .prepare_embedding_generation(
+            &profile,
+            &[Corpus::Emails],
+            db.embedding_generation_control().unwrap().revision,
+        )
+        .unwrap();
+    for snapshot in db
+        .embedding_source_snapshots(lease.generation_id, Corpus::Emails, Some("acc-ret"), 10)
+        .unwrap()
+    {
+        let input = format!("Synthetic formatted fixture input {:?}", snapshot.content);
+        db.store_generation_embeddings(&lease, &snapshot.source, &[input], &[vec![0.1; 4096]])
+            .unwrap();
+    }
+    db.validate_embedding_generation(&lease).unwrap();
+    db.activate_embedding_generation(&lease).unwrap();
+    let query = TypedQueryEmbedding::new(
+        db.active_embedding_write_lease().unwrap().unwrap(),
+        &profile,
+        "forecast",
+        vec![0.1; 4096],
+    )
+    .unwrap();
+    let vector_ids = || {
+        let mut ids: Vec<String> = fetch_vector(
+            &db,
+            VectorRequest {
+                account_id: "acc-ret",
+                embedding: &query,
+                exact_input: "forecast",
+                categories: None,
+                limit: 10,
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(vector_ids(), vec!["r-junk", "r-live", "r-trashed"]);
+    db.delete_email("r-trashed").unwrap();
+    emailops_lib::services::junk::set_feedback(&db, "acc-ret", "r-junk", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        vector_ids(),
+        vec!["r-live"],
+        "junk/deleted vectors are excluded immediately with the same typed query"
+    );
+    emailops_lib::services::junk::set_feedback(&db, "acc-ret", "r-junk", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        vector_ids(),
+        vec!["r-live"],
+        "un-junk must not restore invalidated vector bytes before reindexing"
+    );
+    let active = db.active_embedding_write_lease().unwrap().unwrap();
+    let pending = db
+        .embedding_source_snapshots(active.generation_id, Corpus::Emails, Some("acc-ret"), 10)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].source.source_id, "r-junk");
+    db.store_active_generation_embeddings(
+        &active,
+        &pending[0].source,
+        &[format!("Synthetic formatted fixture input {:?}", pending[0].content)],
+        &[vec![0.1; 4096]],
+    )
+    .unwrap();
+    assert_eq!(
+        vector_ids(),
+        vec!["r-junk", "r-live"],
+        "current un-junked source can be reindexed; trashed source stays excluded"
     );
 }
 

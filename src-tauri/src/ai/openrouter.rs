@@ -372,16 +372,19 @@ struct OpenRouterEmbeddingRequest {
 pub enum EmbeddingDimensions {
     /// The model honours the `dimensions` parameter: send it on every request.
     Requested,
+    /// A managed settings choice explicitly requesting a nonlegacy size.
+    Explicit(usize),
     /// The model returns the right size on its own: send no `dimensions`.
     Native,
 }
 
 impl EmbeddingDimensions {
     /// The value stored in preferences for this mode.
-    pub fn as_pref(self) -> &'static str {
+    pub fn as_pref(self) -> String {
         match self {
-            Self::Requested => "requested",
-            Self::Native => "native",
+            Self::Requested => "requested".into(),
+            Self::Explicit(n) => format!("explicit:{n}"),
+            Self::Native => "native".into(),
         }
     }
 
@@ -389,13 +392,18 @@ impl EmbeddingDimensions {
         match raw {
             "requested" => Some(Self::Requested),
             "native" => Some(Self::Native),
-            _ => None,
+            _ => raw
+                .strip_prefix("explicit:")
+                .and_then(|n| n.parse::<usize>().ok())
+                .filter(|n| (1..=8192).contains(n))
+                .map(Self::Explicit),
         }
     }
 
     fn request_value(self) -> Option<usize> {
         match self {
             Self::Requested => Some(EMAIL_EMBEDDING_DIM),
+            Self::Explicit(n) => Some(n),
             Self::Native => None,
         }
     }
@@ -484,6 +492,7 @@ const EMBEDDING_NOT_SET_UP: &str =
 
 #[derive(Debug, Deserialize)]
 struct OpenRouterEmbeddingResponse {
+    model: Option<String>,
     data: Vec<EmbeddingDataItem>,
     usage: Option<EmbeddingUsage>,
 }
@@ -491,12 +500,30 @@ struct OpenRouterEmbeddingResponse {
 #[derive(Debug, Deserialize)]
 struct EmbeddingDataItem {
     embedding: Vec<f32>,
+    index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 struct EmbeddingUsage {
     prompt_tokens: Option<u32>,
     cost: Option<f64>,
+}
+
+/// Validate without altering the provider's output; cosine requires nonzero norm.
+pub(crate) fn validate_embedding_vector(vector: &[f32], expected: Option<usize>) -> Result<()> {
+    if !(1..=8192).contains(&vector.len()) || vector.iter().any(|v| !v.is_finite()) || !vector.iter().any(|v| *v != 0.0)
+    {
+        return Err(AppError::AiError(
+            "Embedding must contain 1–8192 finite floats with nonzero norm".into(),
+        ));
+    }
+    if expected.is_some_and(|size| size != vector.len()) {
+        return Err(AppError::InvalidInput(format!(
+            "Embedding returned {} dimensions; expected {}. Select Native and probe the model's actual dimensions, or choose a model supporting the requested size.",
+            vector.len(), expected.unwrap_or_default(),
+        )));
+    }
+    Ok(())
 }
 
 pub struct OpenRouterClient {
@@ -507,6 +534,7 @@ pub struct OpenRouterClient {
     /// `Some` only when `embedding_model` passed the probe; without it no
     /// embedding request is sent.
     embedding_dimensions: Option<EmbeddingDimensions>,
+    embedding_observed_dimensions: usize,
     zero_data_retention: bool,
     base_url: String,
     endpoint: Endpoint,
@@ -521,8 +549,14 @@ impl OpenRouterClient {
     pub fn new(api_key: String, model: String, embedding_model: String) -> Self {
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_else(|_| {
+                Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap_or_default()
+            });
 
         Self {
             client,
@@ -530,6 +564,7 @@ impl OpenRouterClient {
             model,
             embedding_model,
             embedding_dimensions: None,
+            embedding_observed_dimensions: EMAIL_EMBEDDING_DIM,
             zero_data_retention: false,
             base_url: OPENROUTER_BASE_URL.to_string(),
             endpoint: Endpoint::OpenRouter,
@@ -627,6 +662,11 @@ impl OpenRouterClient {
     /// validated it for (see [`validated_embedding`]).
     pub fn with_embedding_dimensions(mut self, dimensions: Option<EmbeddingDimensions>) -> Self {
         self.embedding_dimensions = dimensions;
+        self
+    }
+
+    pub fn with_observed_embedding_dimensions(mut self, dimensions: usize) -> Self {
+        self.embedding_observed_dimensions = dimensions;
         self
     }
 
@@ -744,18 +784,58 @@ impl OpenRouterClient {
             )))
         })?;
 
-        let embedding = body.data.first().map(|item| item.embedding.clone()).ok_or_else(|| {
-            EmbeddingFailure::other(AppError::AiError(format!(
-                "{} returned no embedding vector",
-                self.server_name()
-            )))
-        })?;
+        if body
+            .model
+            .as_deref()
+            .is_some_and(|model| !model.is_empty() && model != self.embedding_model)
+        {
+            return Err(EmbeddingFailure::other(AppError::AiError("Embedding response advertised a different model; select the server's actual model and probe it before building".into())));
+        }
+        if body.data.len() != 1 || body.data[0].index.is_some_and(|index| index != 0) {
+            return Err(EmbeddingFailure::other(AppError::AiError(
+                "Embedding response must contain exactly one result associated with input index 0".into(),
+            )));
+        }
+        let embedding = body
+            .data
+            .into_iter()
+            .next()
+            .map(|item| item.embedding)
+            .ok_or_else(|| EmbeddingFailure::other(AppError::AiError("Embedding response is empty".into())))?;
+        validate_embedding_vector(&embedding, None).map_err(EmbeddingFailure::other)?;
 
         Ok(EmbeddingResult {
             embedding,
             tokens: body.usage.as_ref().and_then(|usage| usage.prompt_tokens).unwrap_or(0),
             cost_usd: body.usage.as_ref().and_then(|usage| usage.cost).unwrap_or(0.0),
         })
+    }
+
+    /// Managed generations supply their immutable policy and observed dimensions.
+    /// Native probing passes `None`; normal inference always passes the saved size.
+    pub async fn embed_profile(
+        &self,
+        text: &str,
+        policy: &crate::db::embedding_generations::DimensionPolicy,
+        observed_dimensions: Option<usize>,
+    ) -> Result<EmbeddingResult> {
+        use crate::db::embedding_generations::DimensionPolicy;
+        let requested = match policy {
+            DimensionPolicy::Native => None,
+            DimensionPolicy::Explicit(n) if (1..=8192).contains(n) => Some(*n),
+            DimensionPolicy::Explicit(_) => {
+                return Err(AppError::InvalidInput(
+                    "Embedding dimensions must be between 1 and 8192".into(),
+                ))
+            }
+        };
+        let result = self.request_embedding(text, requested).await.map_err(|failure| {
+            if requested.is_some() && failure.rejected {
+                AppError::InvalidInput(format!("The server rejected Explicit embedding dimensions: {}. Select Native and probe the model's actual dimensions.", failure.error))
+            } else { failure.error }
+        })?;
+        validate_embedding_vector(&result.embedding, requested.or(observed_dimensions))?;
+        Ok(result)
     }
 
     /// Find out whether the configured embedding model can fill the email
@@ -1220,9 +1300,12 @@ impl AIProvider for OpenRouterClient {
         let Some(dimensions) = self.embedding_dimensions else {
             return Err(AppError::AiError(EMBEDDING_NOT_SET_UP.to_string()));
         };
-        self.request_embedding(text, dimensions.request_value())
+        let result = self
+            .request_embedding(text, dimensions.request_value())
             .await
-            .map_err(|failure| failure.error)
+            .map_err(|failure| failure.error)?;
+        validate_embedding_vector(&result.embedding, Some(self.embedding_observed_dimensions))?;
+        Ok(result)
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<EmbeddingResult>> {
@@ -2267,6 +2350,162 @@ mod embedding_tests {
             .iter()
             .map(|request| serde_json::from_slice(&request.body).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn managed_observed_native_size_is_enforced_by_the_legacy_provider_adapter() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(vector_reply(4096))
+            .mount(&server)
+            .await;
+        let valid = client(&server)
+            .with_embedding_dimensions(Some(EmbeddingDimensions::Native))
+            .with_observed_embedding_dimensions(4096);
+        assert_eq!(valid.embed("synthetic input").await.unwrap().embedding.len(), 4096);
+        let stale = client(&server)
+            .with_embedding_dimensions(Some(EmbeddingDimensions::Native))
+            .with_observed_embedding_dimensions(768);
+        assert!(stale.embed("synthetic input").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_native_accepts_4096_and_explicit_refuses_ignored_dimensions() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(vector_reply(4096))
+            .mount(&server)
+            .await;
+        let client = client(&server);
+        let native = client
+            .embed_profile(
+                "neutral",
+                &crate::db::embedding_generations::DimensionPolicy::Native,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(native.embedding.len(), 4096);
+        let error = client
+            .embed_profile(
+                "neutral",
+                &crate::db::embedding_generations::DimensionPolicy::Explicit(768),
+                Some(768),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Native"));
+        let bodies = embedding_bodies(&server).await;
+        assert!(bodies[0].get("dimensions").is_none());
+        assert_eq!(bodies[1]["dimensions"], 768);
+    }
+
+    #[tokio::test]
+    async fn managed_explicit_dimensions_are_sent_and_rejection_offers_native_without_retry() {
+        use crate::db::embedding_generations::DimensionPolicy;
+        for dimensions in [768, 2560, 4096] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/embeddings"))
+                .and(body_partial_json(json!({"dimensions":dimensions})))
+                .respond_with(vector_reply(dimensions))
+                .mount(&server)
+                .await;
+            let result = client(&server)
+                .embed_profile("neutral", &DimensionPolicy::Explicit(dimensions), Some(dimensions))
+                .await
+                .unwrap();
+            assert_eq!(result.embedding.len(), dimensions);
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"dimensions unsupported"}})),
+            )
+            .mount(&server)
+            .await;
+        let error = client(&server)
+            .embed_profile("neutral", &DimensionPolicy::Explicit(768), Some(768))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Native"));
+        assert_eq!(embedding_bodies(&server).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn managed_embedding_never_follows_a_redirect_to_another_destination() {
+        let source = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(307).insert_header("location", format!("{}/embeddings", destination.uri())),
+            )
+            .mount(&source)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(vector_reply(768))
+            .mount(&destination)
+            .await;
+        assert!(client(&source)
+            .embed_profile(
+                "synthetic input",
+                &crate::db::embedding_generations::DimensionPolicy::Explicit(768),
+                Some(768)
+            )
+            .await
+            .is_err());
+        assert!(destination.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_response_rejects_a_different_advertised_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"model":"other/embed","data":[{"index":0,"embedding":vec![0.5;768]}]})),
+            )
+            .mount(&server)
+            .await;
+        assert!(client(&server)
+            .embed_profile(
+                "neutral",
+                &crate::db::embedding_generations::DimensionPolicy::Explicit(768),
+                Some(768)
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_response_requires_one_associated_finite_nonzero_vector() {
+        for data in [
+            json!([]),
+            json!([{"embedding":[1.0], "index":0},{"embedding":[2.0], "index":1}]),
+            json!([{"embedding":[1.0], "index":1}]),
+            json!([{"embedding":[0.0], "index":0}]),
+            json!([{"embedding":[1e100], "index":0}]),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/embeddings"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data":data})))
+                .mount(&server)
+                .await;
+            assert!(client(&server)
+                .embed_profile(
+                    "neutral",
+                    &crate::db::embedding_generations::DimensionPolicy::Native,
+                    None
+                )
+                .await
+                .is_err());
+        }
     }
 
     #[test]
