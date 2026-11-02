@@ -16,6 +16,11 @@ export type AiSettingsInput = {
   thinkingEnabled: boolean | null;
   zeroDataRetention: boolean | null;
   /**
+   * Omitted preserves the current processing scope for older callers.
+   */
+  maxEmailCount: number | null;
+  maxEmailAgeDays: number | null;
+  /**
    * Required when `provider` is the OpenAI-compatible server.
    */
   server: ServerSettingsInput | null;

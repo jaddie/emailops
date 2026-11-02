@@ -762,6 +762,8 @@
     "MemoryFacts": "Mémoire",
     "HelpDocs": "Documents d’aide",
     "confirm": "Créer et activer {{model}} avec {{dimensions}} dimensions détectées ? Tout index actif vérifié reste disponible pendant la création.",
+    "confirmResume": "Reprendre et activer {{model}} avec {{dimensions}} dimensions ? Le travail vérifié est conservé ; les sources restantes peuvent être envoyées au fournisseur sélectionné.",
+    "confirmRollback": "Autoriser le retour à {{model}} avec {{dimensions}} dimensions en utilisant la destination affichée et vos identifiants actuels ? Les vecteurs vérifiés sont réutilisés et les sources modifiées sont retraitées.",
     "requested": "Demandées",
     "detected": "Détectées",
     "activate": "Créer et activer",

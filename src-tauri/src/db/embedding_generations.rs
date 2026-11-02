@@ -238,6 +238,35 @@ fn carry_active_scope(conn: &Connection, previous_revision: i64) -> Result<()> {
     Ok(())
 }
 
+fn apply_preference_writes(conn: &Connection, preferences: &[(String, Option<String>)]) -> Result<()> {
+    for (key, value) in preferences {
+        match value {
+            Some(value) => {
+                conn.execute("INSERT INTO user_preferences(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE value IS NOT excluded.value",params![key,value])?;
+            }
+            None => {
+                conn.execute("DELETE FROM user_preferences WHERE key=?1", [key])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn refresh_active_scope_after_preferences(conn: &Connection, active: Option<i64>, revision: i64) -> Result<()> {
+    if let Some(active) = active {
+        let healthy: bool = conn.query_row(
+            "SELECT state='active' FROM embedding_generations WHERE id=?1",
+            [active],
+            |r| r.get(0),
+        )?;
+        if healthy {
+            snapshot_email_scope(conn, active)?;
+            conn.execute("UPDATE embedding_generations SET scope_revision=?2,mutation_version=mutation_version+1,validation_json=NULL WHERE id=?1",params![active,revision])?;
+        }
+    }
+    Ok(())
+}
+
 fn check_lease(conn: &Connection, lease: &BuildLease) -> Result<usize> {
     check_lease_at(conn, lease, now())
 }
@@ -481,6 +510,13 @@ impl Database {
     }
 
     pub fn embedding_generation_status(&self, generation: i64) -> Result<GenerationStatus> {
+        self.embedding_generation_status_at(generation, now())
+    }
+
+    /// Status polling also performs expired-owner recovery: a fast restart must
+    /// not leave an abandoned owner looking healthy after its deadline passes.
+    pub(crate) fn embedding_generation_status_at(&self, generation: i64, timestamp: i64) -> Result<GenerationStatus> {
+        self.recover_embedding_generations_at(timestamp)?;
         Ok(self.reader().query_row(
             "SELECT id,fingerprint,dimensions,state,epoch,
                (SELECT count(*) FROM embedding_generation_items WHERE generation_id=g.id AND status='complete'),
@@ -759,8 +795,12 @@ impl Database {
     /// Recover only expired owners: opening a second app/CLI must not cancel a
     /// healthy worker in another process. No inference is restarted here.
     pub fn recover_embedding_generations(&self) -> Result<usize> {
+        self.recover_embedding_generations_at(now())
+    }
+
+    fn recover_embedding_generations_at(&self, timestamp: i64) -> Result<usize> {
         let conn = self.connection();
-        Ok(conn.execute("UPDATE embedding_generations SET state='interrupted',epoch=epoch+1,owner=NULL,lease_until=NULL,validation_json=NULL,error='Embedding worker lease expired' WHERE state IN ('preparing','building','validating') AND (lease_until IS NULL OR lease_until<=?1)", [now()])?)
+        Ok(conn.execute("UPDATE embedding_generations SET state='interrupted',epoch=epoch+1,owner=NULL,lease_until=NULL,validation_json=NULL,error='Embedding worker lease expired' WHERE state IN ('preparing','building','validating') AND (lease_until IS NULL OR lease_until<=?1)", [timestamp])?)
     }
 
     /// The service must re-probe identity and authorization before explicit
@@ -771,28 +811,47 @@ impl Database {
         expected_fingerprint: &str,
         expected_revision: i64,
     ) -> Result<BuildLease> {
+        self.resume_embedding_generation_with_preferences(generation, expected_fingerprint, expected_revision, &[])
+    }
+
+    /// Publish explicitly proposed settings/credential references with the new
+    /// lease, preserving complete sources still eligible in the refreshed scope.
+    /// Provider identity, permission and requested-corpus checks belong to the
+    /// service before this transaction; the revision/fingerprint fence is final.
+    pub fn resume_embedding_generation_with_preferences(
+        &self,
+        generation: i64,
+        expected_fingerprint: &str,
+        expected_revision: i64,
+        preferences: &[(String, Option<String>)],
+    ) -> Result<BuildLease> {
         let mut conn = self.connection();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = control(&tx)?;
         if current.pending_id != Some(generation) || current.revision != expected_revision {
             return invalid("Embedding configuration changed");
         }
+        apply_preference_writes(&tx, preferences)?;
+        let revision = control(&tx)?.revision;
         let owner = uuid::Uuid::new_v4().to_string();
         let changed=tx.execute("UPDATE embedding_generations SET state='building',epoch=epoch+1,owner=?2,lease_until=?3,config_revision=?4,error=NULL,validation_json=NULL WHERE id=?1 AND fingerprint=?5 AND state IN ('paused','failed','interrupted')",
-            params![generation,owner,now()+LEASE_SECONDS,expected_revision,expected_fingerprint])?;
+            params![generation,owner,now()+LEASE_SECONDS,revision,expected_fingerprint])?;
         if changed != 1 {
             return invalid("Candidate is not resumable or profile changed");
         }
         snapshot_email_scope(&tx, generation)?;
         tx.execute(
             "UPDATE embedding_generations SET scope_revision=?2,mutation_version=mutation_version+1 WHERE id=?1",
-            params![generation, expected_revision],
+            params![generation, revision],
         )?;
         let epoch = tx.query_row(
             "SELECT epoch FROM embedding_generations WHERE id=?1",
             [generation],
             |r| r.get(0),
         )?;
+        if !preferences.is_empty() {
+            refresh_active_scope_after_preferences(&tx, current.active_id, revision)?;
+        }
         tx.commit()?;
         Ok(BuildLease {
             generation_id: generation,
@@ -862,12 +921,72 @@ impl Database {
         tx.execute("UPDATE embedding_generations SET state='active',epoch=epoch+1,owner=NULL,lease_until=NULL,scope_revision=(SELECT revision+1 FROM embedding_control) WHERE id=?1", [lease.generation_id])?;
         tx.execute("UPDATE embedding_control SET retained_id=active_id,active_id=?1,pending_id=NULL,revision=revision+1 WHERE singleton=1", [lease.generation_id])?;
         tx.commit()?;
+        drop(conn);
+        // Activation is complete. A separate cleanup failure cannot turn a
+        // successful activation into a failed build or invalidate its rollback.
+        if let Err(error) = self.cleanup_obsolete_embedding_generations() {
+            crate::services::logger::log(
+                "warn",
+                "embeddings",
+                format!(
+                    "Embedding index activated; obsolete retained index cleanup failed and can be retried: {error}"
+                ),
+            );
+        }
         Ok(())
+    }
+
+    /// Retryable, independent post-activation GC. Never use explicit discard:
+    /// it changes the control revision. Any pending candidate protects schema
+    /// stability through its own validation/activation window, so skip all DDL.
+    pub fn cleanup_obsolete_embedding_generations(&self) -> Result<usize> {
+        let mut conn = self.connection();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = control(&tx)?;
+        if current.pending_id.is_some() {
+            tx.commit()?;
+            return Ok(0);
+        }
+        let obsolete = {
+            let mut stmt=tx.prepare("SELECT id FROM embedding_generations WHERE id>0 AND state='retained' AND id IS NOT ?1 AND id IS NOT ?2 AND id IS NOT ?3 ORDER BY id")?;
+            let rows = stmt
+                .query_map(
+                    params![current.active_id, current.retained_id, current.pending_id],
+                    |r| r.get::<_, i64>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for generation in &obsolete {
+            for corpus in Corpus::ALL {
+                let table = vector_table(*generation, corpus)?;
+                tx.execute_batch(&format!(
+                    "DROP TRIGGER IF EXISTS invalidate_{table}; DROP TABLE IF EXISTS {table};"
+                ))?;
+            }
+            tx.execute(
+                "DELETE FROM embedding_generations WHERE id=?1 AND state='retained'",
+                [generation],
+            )?;
+        }
+        tx.commit()?;
+        Ok(obsolete.len())
     }
 
     /// Reopen retained data as the candidate, preserving the active generation.
     /// Catch-up and normal validation/activation are mandatory before switching.
     pub fn prepare_embedding_rollback(&self, expected_revision: i64, fingerprint: &str) -> Result<BuildLease> {
+        self.prepare_embedding_rollback_with_preferences(expected_revision, fingerprint, &[])
+    }
+
+    /// Re-authorized destination/settings are supplied by the caller, never
+    /// reconstructed from retained profiles or historical credential references.
+    pub fn prepare_embedding_rollback_with_preferences(
+        &self,
+        expected_revision: i64,
+        fingerprint: &str,
+        preferences: &[(String, Option<String>)],
+    ) -> Result<BuildLease> {
         let mut conn = self.connection();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = control(&tx)?;
@@ -877,8 +996,9 @@ impl Database {
         let generation = current
             .retained_id
             .ok_or_else(|| AppError::InvalidInput("No retained generation".into()))?;
+        apply_preference_writes(&tx, preferences)?;
         let owner = uuid::Uuid::new_v4().to_string();
-        let revision = current.revision + 1;
+        let revision = control(&tx)?.revision + 1;
         let changed=tx.execute("UPDATE embedding_generations SET state='building',epoch=epoch+1,owner=?2,lease_until=?3,config_revision=?4,validation_json=NULL WHERE id=?1 AND state='retained' AND fingerprint=?5",
             params![generation,owner,now()+LEASE_SECONDS,revision,fingerprint])?;
         if changed != 1 {
@@ -898,7 +1018,11 @@ impl Database {
             "UPDATE embedding_control SET pending_id=?1,retained_id=NULL,revision=?2",
             params![generation, revision],
         )?;
-        carry_active_scope(&tx, current.revision)?;
+        if preferences.is_empty() {
+            carry_active_scope(&tx, current.revision)?;
+        } else {
+            refresh_active_scope_after_preferences(&tx, current.active_id, revision)?;
+        }
         tx.commit()?;
         Ok(BuildLease {
             generation_id: generation,

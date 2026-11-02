@@ -762,6 +762,8 @@
     "MemoryFacts": "Memory",
     "HelpDocs": "Help documents",
     "confirm": "Build and activate {{model}} with {{dimensions}} detected dimensions? Any verified active index remains available during the build.",
+    "confirmResume": "Resume and activate {{model}} with {{dimensions}} dimensions? Completed verified work is preserved; remaining sources may be sent to the selected provider.",
+    "confirmRollback": "Authorize rollback to {{model}} with {{dimensions}} dimensions using the displayed destination and your current credentials? Verified vectors are reused; changed sources are rebuilt.",
     "requested": "Requested",
     "detected": "Detected",
     "activate": "Build and activate",

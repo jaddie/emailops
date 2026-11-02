@@ -101,6 +101,8 @@ pub async fn set_ai_config(
     thinking_enabled: Option<bool>,
     zero_data_retention: Option<bool>,
     server: Option<ServerSettingsInput>,
+    max_email_count: Option<u32>,
+    max_email_age_days: Option<u32>,
 ) -> Result<(), AppError> {
     let input = AiSettingsInput {
         provider,
@@ -111,6 +113,8 @@ pub async fn set_ai_config(
         thinking_enabled,
         zero_data_retention,
         server,
+        max_email_count,
+        max_email_age_days,
     };
     // Everything is checked (and a new server embedding model probed) before
     // anything is written.
@@ -464,8 +468,12 @@ pub async fn preview_embedding_settings(
     state: State<'_, AppState>,
     input: AiSettingsInput,
     policy: crate::db::embedding_generations::DimensionPolicy,
+    rollback: Option<bool>,
 ) -> Result<services::embedding_runtime::EmbeddingBuildPreview, AppError> {
     use crate::db::embedding_generations::Corpus;
+    if rollback.unwrap_or(false) {
+        return services::embedding_runtime::preview_settings_rollback(&state.db, input).await;
+    }
     let mut corpora = vec![Corpus::Emails];
     if state.db.is_memory_enabled()? {
         corpora.push(Corpus::MemoryFacts);

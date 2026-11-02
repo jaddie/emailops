@@ -1177,6 +1177,8 @@ export async function setAiConfig(
   zeroDataRetention?: boolean,
   /** Required when `provider` is the OpenAI-compatible server. */
   server?: ServerSettingsInput,
+  maxEmailCount?: number,
+  maxEmailAgeDays?: number,
 ): Promise<void> {
   return invoke('set_ai_config', {
     provider,
@@ -1187,6 +1189,8 @@ export async function setAiConfig(
     thinkingEnabled: thinkingEnabled ?? false,
     zeroDataRetention,
     server,
+    maxEmailCount,
+    maxEmailAgeDays,
   });
 }
 
@@ -2476,8 +2480,9 @@ export async function getEmbeddingLifecycle(): Promise<EmbeddingLifecycle> {
 export async function previewEmbeddingSettings(
   input: EmbeddingSettingsInput,
   policy: EmbeddingDimensionPolicy,
+  rollback?: boolean,
 ): Promise<EmbeddingBuildPreview> {
-  return invoke('preview_embedding_settings', { input, policy });
+  return invoke('preview_embedding_settings', { input, policy, rollback });
 }
 export async function commitEmbeddingSettings(
   input: EmbeddingSettingsInput,

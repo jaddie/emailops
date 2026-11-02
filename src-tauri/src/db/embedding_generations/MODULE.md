@@ -141,7 +141,7 @@ transaction. Current credential references are always resolved live; profile and
 rollback metadata contain none. Clearing a reference revokes authority even if an
 old vault entry remains. Legacy fixed references remain readable.
 
-Rollback to a different previously configured endpoint is intentionally refused
+Simple rollback to a different previously configured endpoint is intentionally refused
 until that destination/source is explicitly selected and authorized again with
 current disclosure/key settings. The backend returns an actionable authorization
 message; Stage 4 must display it rather than present a generic rebuild failure.
@@ -168,7 +168,8 @@ failure. Heartbeats never revive an expired lease.
 an embedding request, stages credentials as usual, then atomically saves settings
 and pauses/fences pending work. It preserves active profile/vector bytes. Frozen
 sessions and typed retrieval both check the live empty-model opt-out. Re-enabling
-uses the explicit settings/build workflow; no paid work resumes automatically.
+uses the explicit settings resume/build workflow; a matching paused generation
+can retain its verified progress, and no paid work resumes automatically.
 
 Legacy `AiService::save_config`, `prepare_ai_settings` and `apply_ai_settings`
 share a model/backend/server-endpoint/dimension-policy guard whenever a managed
@@ -180,3 +181,49 @@ writes use an optimistic revision fence and one SQLite transaction. Generic
 unrelated preferences pass through normally, while current credential references,
 disclosure and canary metadata remain backend-owned. These guards do not wrap
 fixture/eval code that deliberately configures its own database directly.
+
+Processing count/age limits travel with `AiSettingsInput` as optional
+`maxEmailCount`/`maxEmailAgeDays` fields. Proposed values participate in the
+non-secret preview fingerprint and are persisted before candidate scope is
+snapshotted in the same transaction. Older callers that omit them preserve
+existing preferences. Ordinary saves and explicit opt-out use the same planned
+preference writes; the frontend never writes these limits after enqueueing.
+
+## Polled lease recovery and retained-index collection
+
+`embedding_generation_status` runs expired-owner recovery at the database status
+boundary, using the current time, before reading status. A fast reopen can still
+show a healthy unexpired lease, but a later status poll marks its expired owner
+`interrupted`, increments its epoch and clears ownership without restarting any
+inference. A provided-time helper makes this testable with `FixedClock`; healthy
+other-process owners are unchanged and stale worker results remain fenced.
+
+After a successful activation commits, `cleanup_obsolete_embedding_generations`
+runs in a separate top-level transaction. It selects only unreferenced `retained`
+generations above zero, protecting the active pointer, current rollback pointer
+and any pending candidate. With any `pending_id` it performs no DDL; this preserves
+schema-version validation. Cleanup drops each obsolete generation's invalidation
+triggers/vector tables and cascades its metadata together, without changing the
+control revision. Activation does not fail if cleanup fails: a warning is logged,
+and the public cleanup method or the next activation can retry. Active and previous
+rollback indexes remain usable after cleanup failure.
+
+File-backed tests cover four activations with storage bounded to generation zero,
+active and previous; injected DELETE and DROP failures with complete DDL/metadata
+rollback; no schema change during pending validation; and a pinned sqlite-vec old
+reader retaining its metadata and KNN snapshot while another connection collects
+the obsolete table. A new reader sees the table removed after its snapshot ends.
+
+`resume_embedding_generation_with_preferences` and
+`prepare_embedding_rollback_with_preferences` are the atomic DB boundaries for
+explicitly proposed settings plus retained progress/data. Their existing variants
+delegate with no preference writes. The service must freshly validate provider
+identity, current disclosure/credentials and the proposed requested-corpus set.
+The DB transaction rechecks revision, pointer, resumable state and fingerprint,
+publishes only the caller's current settings/credential references, snapshots the
+resulting scope and obtains a new owner/epoch. It preserves complete current
+sources that remain applicable and purges newly excluded sources transactionally.
+A failed transition rolls back settings and scope changes together. No profile or
+rollback record supplies a credential or restores consent. Explicitly re-authorized
+cross-destination rollback can use this boundary; the simple rollback path still
+refuses to infer historical destination/key authorization.

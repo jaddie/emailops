@@ -393,6 +393,59 @@ describe('AiSettings — embedding model', () => {
     expect(reindexDialogShown()).toBe(false);
   });
 
+  it('explicitly re-enables the paused candidate model through settings preview and confirmation', async () => {
+    const status = {
+      revision: 4,
+      active: null,
+      retained: null,
+      pending: {
+        status: { id: 2, state: 'paused', dimensions: 768 },
+        profile: { model: 'vendor/embed', backend: 'openrouter', dimension_policy: 'Native' },
+        corpora: [],
+      },
+    };
+    api.getEmbeddingLifecycle.mockResolvedValueOnce(status as never).mockResolvedValueOnce(status as never);
+    api.previewEmbeddingSettings.mockResolvedValueOnce({
+      action: { Resume: { generation: 2 } },
+      profile: { model: 'vendor/embed', dimensions: 768, dimension_policy: 'Native' },
+    } as never);
+    await mount({ embeddingModel: '' });
+    await act(async () => {
+      button('embeddingLifecycle.resume').click();
+    });
+    await settle();
+    expect(api.previewEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ embeddingModel: 'vendor/embed' }),
+      'Native',
+    );
+    expect(container.textContent).toContain('settings:embeddingLifecycle.confirmResume');
+    expect(api.disableEmbeddingSettings).not.toHaveBeenCalled();
+    await confirmReindex();
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ embeddingModel: 'vendor/embed' }),
+      'Native',
+      expect.objectContaining({ action: { Resume: { generation: 2 } } }),
+    );
+  });
+
+  it('commits processing scope with the candidate and makes no later scope preference writes', async () => {
+    await mount({});
+    await choose('vendor/embed-large');
+    await save();
+    await confirmReindex();
+    expect(api.previewEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ maxEmailCount: 1000, maxEmailAgeDays: 365 }),
+      expect.anything(),
+    );
+    expect(api.commitEmbeddingSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ maxEmailCount: 1000, maxEmailAgeDays: 365 }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(api.setPref).not.toHaveBeenCalledWith('ai_max_email_count', expect.anything());
+    expect(api.setPref).not.toHaveBeenCalledWith('ai_max_email_age_days', expect.anything());
+  });
+
   it('asks before replacing the Embeddings, and does nothing until answered', async () => {
     await mount({});
     await choose('vendor/embed-large');

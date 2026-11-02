@@ -78,6 +78,39 @@ describe('embedding lifecycle', () => {
     expect(element.textContent).toContain('Select and authorize the retained destination');
     await act(async () => root.unmount());
   });
+  it('previews retained rollback with the current settings before any action commits', async () => {
+    api.getEmbeddingLifecycle.mockResolvedValue({
+      revision: 9,
+      active: null,
+      pending: null,
+      retained: {
+        status: { id: 3, state: 'retained', dimensions: 768 },
+        profile: { model: 'old', backend: 'server', dimension_policy: { Explicit: 768 } },
+        corpora: [],
+      },
+    });
+    const onRollback = vi.fn();
+    const element = document.createElement('div');
+    document.body.appendChild(element);
+    const root = createRoot(element);
+    await act(async () => {
+      root.render(
+        <EmbeddingLifecycle
+          policy="Native"
+          onPolicy={vi.fn()}
+          onBuild={vi.fn()}
+          onRollback={onRollback}
+          busy={false}
+        />,
+      );
+    });
+    await act(async () => {
+      [...element.querySelectorAll('button')].find((b) => b.textContent === 'embeddingLifecycle.rollback')?.click();
+    });
+    expect(onRollback).toHaveBeenCalledOnce();
+    expect(api.controlEmbeddingBuild).not.toHaveBeenCalled();
+    await act(async () => root.unmount());
+  });
   it('does not let an older poll overwrite the refreshed status after stop', async () => {
     vi.useFakeTimers();
     const running = {

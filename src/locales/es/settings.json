@@ -762,6 +762,8 @@
     "MemoryFacts": "Memoria",
     "HelpDocs": "Documentos de ayuda",
     "confirm": "¿Crear y activar {{model}} con {{dimensions}} dimensiones detectadas? Si existe un índice activo verificado, seguirá disponible durante la creación.",
+    "confirmResume": "¿Reanudar y activar {{model}} con {{dimensions}} dimensiones? Se conserva el trabajo verificado; las fuentes pendientes pueden enviarse al proveedor seleccionado.",
+    "confirmRollback": "¿Autorizar la reversión a {{model}} con {{dimensions}} dimensiones usando el destino mostrado y las credenciales actuales? Se reutilizan los vectores verificados y se procesan las fuentes modificadas.",
     "requested": "Solicitadas",
     "detected": "Detectadas",
     "activate": "Crear y activar",

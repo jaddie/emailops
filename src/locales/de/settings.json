@@ -762,6 +762,8 @@
     "MemoryFacts": "Speicher",
     "HelpDocs": "Hilfedokumente",
     "confirm": "{{model}} mit {{dimensions}} erkannten Dimensionen erstellen und aktivieren? Ein verifizierter aktiver Index bleibt während des Aufbaus verfügbar.",
+    "confirmResume": "{{model}} mit {{dimensions}} Dimensionen fortsetzen und aktivieren? Verifizierte Arbeit bleibt erhalten; ausstehende Quellen können an den ausgewählten Anbieter gesendet werden.",
+    "confirmRollback": "Rollback zu {{model}} mit {{dimensions}} Dimensionen für das angezeigte Ziel und die aktuellen Zugangsdaten autorisieren? Verifizierte Vektoren werden wiederverwendet, geänderte Quellen neu verarbeitet.",
     "requested": "Angefordert",
     "detected": "Erkannt",
     "activate": "Erstellen und aktivieren",

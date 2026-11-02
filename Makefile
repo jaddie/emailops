@@ -741,3 +741,11 @@ eval-all:
 	  EVAL_DRAFT_N="$(EVAL_DRAFT_N)" \
 	  EVAL_SNAPSHOT_DB="$(EVAL_SNAPSHOT_DB)" \
 	  bash scripts/eval_all.sh
+
+# Neutral local-server dimension/throughput measurements; see docs/embedding-validation.md.
+.PHONY: benchmark-embeddings eval-embedding-lifecycle
+benchmark-embeddings:
+	python3 scripts/benchmark_embeddings.py $(ARGS)
+
+eval-embedding-lifecycle:
+	bash scripts/eval_embedding_lifecycle.sh $(ARGS)

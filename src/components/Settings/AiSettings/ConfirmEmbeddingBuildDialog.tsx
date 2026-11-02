@@ -11,6 +11,12 @@ export function ConfirmEmbeddingBuildDialog({
 }) {
   useOverlay();
   const { t } = useTranslation(['common', 'settings']);
+  const action =
+    typeof preview.action === 'object' && preview.action !== null
+      ? 'Rollback' in preview.action
+        ? 'rollback'
+        : 'resume'
+      : 'build';
   return (
     <div
       className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60"
@@ -23,16 +29,23 @@ export function ConfirmEmbeddingBuildDialog({
           {t('settings:embeddingLifecycle.title')}
         </h3>
         <p className="text-sm mb-3">
-          {t('settings:embeddingLifecycle.confirm', {
-            model: preview.profile.model,
-            dimensions: preview.profile.dimensions,
-          })}
+          {t(
+            action === 'rollback'
+              ? 'settings:embeddingLifecycle.confirmRollback'
+              : action === 'resume'
+                ? 'settings:embeddingLifecycle.confirmResume'
+                : 'settings:embeddingLifecycle.confirm',
+            {
+              model: preview.profile.model,
+              dimensions: preview.profile.dimensions,
+            },
+          )}
         </p>
         <p className="text-sm mb-3 break-all">
           {preview.profile.backend} {preview.profile.endpoint} ·{' '}
           {preview.profile.model_revision ?? t('settings:embeddingLifecycle.noRevision')}
         </p>
-        <p className="text-sm mb-3">{t('settings:embeddingLifecycle.warning')}</p>
+        {action === 'build' && <p className="text-sm mb-3">{t('settings:embeddingLifecycle.warning')}</p>}
         {preview.opaqueIdentity && <p className="text-sm mb-3">{t('settings:embeddingLifecycle.identity')}</p>}
         <div className="flex justify-end gap-2">
           <button type="button" onClick={() => onDecide(false)}>
@@ -43,7 +56,13 @@ export function ConfirmEmbeddingBuildDialog({
             className="px-3 py-1.5 bg-primary-600 text-white rounded"
             onClick={() => onDecide(true)}
           >
-            {t('settings:embeddingLifecycle.activate')}
+            {t(
+              action === 'rollback'
+                ? 'settings:embeddingLifecycle.rollback'
+                : action === 'resume'
+                  ? 'settings:embeddingLifecycle.resume'
+                  : 'settings:embeddingLifecycle.activate',
+            )}
           </button>
         </div>
       </div>

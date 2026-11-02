@@ -8,10 +8,12 @@ interface Props {
   policy: api.EmbeddingDimensionPolicy;
   onPolicy: (policy: api.EmbeddingDimensionPolicy) => void;
   onBuild: () => void;
+  onResume?: (model: string, policy: api.EmbeddingDimensionPolicy) => void;
+  onRollback?: () => void;
   busy: boolean;
 }
 
-export function EmbeddingLifecycle({ policy, onPolicy, onBuild, busy }: Props) {
+export function EmbeddingLifecycle({ policy, onPolicy, onBuild, onResume, onRollback, busy }: Props) {
   const { t } = useTranslation('settings');
   const [lifecycle, setLifecycle] = useState<api.EmbeddingLifecycle | null>(null);
   const [error, setError] = useState('');
@@ -137,7 +139,11 @@ export function EmbeddingLifecycle({ policy, onPolicy, onBuild, busy }: Props) {
               <button
                 type="button"
                 disabled={acting}
-                onClick={() => void action('resume', lifecycle.pending?.status.id ?? null)}
+                onClick={() => {
+                  if (onResume && lifecycle.pending?.profile)
+                    onResume(lifecycle.pending.profile.model, lifecycle.pending.profile.dimension_policy);
+                  else void action('resume', lifecycle.pending?.status.id ?? null);
+                }}
               >
                 {t('embeddingLifecycle.resume')}
               </button>
@@ -151,7 +157,11 @@ export function EmbeddingLifecycle({ policy, onPolicy, onBuild, busy }: Props) {
             </>
           ))}
         {lifecycle?.retained && !lifecycle.pending && (
-          <button type="button" disabled={acting} onClick={() => void action('rollback', null)}>
+          <button
+            type="button"
+            disabled={acting}
+            onClick={() => (onRollback ? onRollback() : void action('rollback', null))}
+          >
             {t('embeddingLifecycle.rollback')}
           </button>
         )}

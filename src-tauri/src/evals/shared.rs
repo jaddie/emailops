@@ -22,6 +22,8 @@ pub const EVAL_MODEL_ENV: &str = "EMAILOPS_EVAL_MODEL";
 pub const EVAL_PROVIDER_ENV: &str = "EMAILOPS_EVAL_PROVIDER";
 /// Base URL of the server when `EMAILOPS_EVAL_PROVIDER=openai_compatible`.
 pub const EVAL_BASE_URL_ENV: &str = "EMAILOPS_EVAL_BASE_URL";
+/// Optional client context budget for a served model's actual loaded window.
+pub const EVAL_CONTEXT_WINDOW_ENV: &str = "EMAILOPS_EVAL_CONTEXT_WINDOW";
 /// Where that server's runs compute embeddings (`inapp` by default, the model
 /// the demo index was built with; `server` or `openrouter` otherwise).
 pub const EVAL_EMBEDDING_SOURCE_ENV: &str = "EMAILOPS_EVAL_EMBEDDING_SOURCE";
@@ -78,14 +80,22 @@ fn apply_eval_server_from_env(db: &Database) -> EvalResult<()> {
             )))
         }
     };
+    let context_window = read_non_empty_env(EVAL_CONTEXT_WINDOW_ENV)
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| EvalError::Config(format!("{EVAL_CONTEXT_WINDOW_ENV}: expected a non-negative integer")))
+        })
+        .transpose()?;
     let input = ServerSettingsInput {
         base_url,
         embedding_source,
+        context_window,
         ..Default::default()
     };
     // `true`: the eval binaries are built with the embedded runtime.
     let plan = ai_server::plan_server_settings(&input, None, true)
-        .map_err(|e| EvalError::Config(format!("{EVAL_BASE_URL_ENV}: {e}")))?;
+        .map_err(|e| EvalError::Config(format!("Eval server settings: {e}")))?;
     ai_server::store_server_settings(db, &plan)?;
     Ok(())
 }
@@ -220,6 +230,7 @@ mod tests {
         std::env::remove_var(EVAL_PROVIDER_ENV);
         std::env::remove_var(EVAL_BASE_URL_ENV);
         std::env::remove_var(EVAL_EMBEDDING_SOURCE_ENV);
+        std::env::remove_var(EVAL_CONTEXT_WINDOW_ENV);
     }
 
     #[test]
@@ -245,6 +256,42 @@ mod tests {
             server.embedding_source,
             crate::services::ai_server::EmbeddingSource::InApp
         );
+    }
+
+    #[test]
+    fn a_server_eval_honours_the_explicit_loaded_context_window() {
+        let _g = env_lock();
+        clear_eval_env();
+        std::env::set_var(EVAL_PROVIDER_ENV, "openai_compatible");
+        std::env::set_var(EVAL_MODEL_ENV, "served-model");
+        std::env::set_var(EVAL_BASE_URL_ENV, "http://127.0.0.1:8080/v1");
+        std::env::set_var(EVAL_CONTEXT_WINDOW_ENV, "8192");
+        let db = fresh_db();
+        let result = apply_eval_model_override_from_env(&db);
+        clear_eval_env();
+
+        result.expect("valid loaded context window");
+        let server = crate::services::ai_server::load_server_settings(&db).expect("settings");
+        assert_eq!(server.context_window, 8192);
+    }
+
+    #[test]
+    fn an_invalid_eval_context_window_leaves_the_fixture_configuration_unchanged() {
+        let _g = env_lock();
+        for value in ["invalid", "-1", "2047", "1048577"] {
+            clear_eval_env();
+            std::env::set_var(EVAL_PROVIDER_ENV, "openai_compatible");
+            std::env::set_var(EVAL_MODEL_ENV, "served-model");
+            std::env::set_var(EVAL_BASE_URL_ENV, "http://127.0.0.1:8080/v1");
+            std::env::set_var(EVAL_CONTEXT_WINDOW_ENV, value);
+            let db = fresh_db();
+            let result = apply_eval_model_override_from_env(&db);
+            clear_eval_env();
+
+            assert!(result.is_err(), "invalid context window {value} was accepted");
+            assert!(db.get_preference("ai_provider").expect("read").is_none());
+            assert!(db.get_preference("openai_compatible_base_url").expect("read").is_none());
+        }
     }
 
     #[test]

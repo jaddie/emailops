@@ -140,6 +140,9 @@ pub struct AiSettingsInput {
     pub monthly_budget_usd: f64,
     pub thinking_enabled: Option<bool>,
     pub zero_data_retention: Option<bool>,
+    /// Omitted preserves the current processing scope for older callers.
+    pub max_email_count: Option<u32>,
+    pub max_email_age_days: Option<u32>,
     /// Required when `provider` is the OpenAI-compatible server.
     pub server: Option<ServerSettingsInput>,
 }
@@ -717,6 +720,12 @@ impl AiService {
                 Some(chrono::Utc::now().timestamp().to_string()),
             ),
         ];
+        if let Some(count) = input.max_email_count {
+            writes.push(("ai_max_email_count".into(), Some(count.to_string())));
+        }
+        if let Some(days) = input.max_email_age_days {
+            writes.push(("ai_max_email_age_days".into(), Some(days.to_string())));
+        }
         if let Some(thinking) = input.thinking_enabled {
             writes.push(("ai_thinking_enabled".into(), Some(thinking.to_string())));
         }
@@ -3451,6 +3460,8 @@ mod server_provider_tests {
             monthly_budget_usd: 0.0,
             thinking_enabled: None,
             zero_data_retention: None,
+            max_email_count: None,
+            max_email_age_days: None,
             server: Some(ServerSettingsInput {
                 base_url: server.uri(),
                 embedding_source: source,

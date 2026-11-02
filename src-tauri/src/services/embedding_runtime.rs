@@ -29,6 +29,27 @@ fn check_format(profile: &EmbeddingProfile) -> Result<()> {
     Ok(())
 }
 
+/// A confirmed settings operation either creates a candidate or reuses one
+/// already owned by the lifecycle. Retained profiles never provide credentials.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(
+    feature = "ts",
+    derive(ts_rs::TS),
+    ts(export, export_to = "../../src/types/generated/")
+)]
+pub enum EmbeddingSettingsAction {
+    #[default]
+    Build,
+    Resume {
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        generation: i64,
+    },
+    Rollback {
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        generation: i64,
+    },
+}
+
 /// A backend preview is fenced against every embedding-settings writer. This
 /// object contains no credential. Commit re-probes before creating any tables.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +60,8 @@ fn check_format(profile: &EmbeddingProfile) -> Result<()> {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct EmbeddingBuildPreview {
+    #[serde(default)]
+    pub action: EmbeddingSettingsAction,
     #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub expected_revision: i64,
     pub profile: EmbeddingProfile,
@@ -63,6 +86,7 @@ pub async fn preview_build(
         ));
     }
     Ok(EmbeddingBuildPreview {
+        action: EmbeddingSettingsAction::Build,
         expected_revision,
         opaque_identity: super::embedding_session::has_opaque_identity(&profile),
         profile,
@@ -72,7 +96,7 @@ pub async fn preview_build(
 }
 
 pub async fn commit_build(db: &Arc<Database>, preview: &EmbeddingBuildPreview) -> Result<BuildLease> {
-    if preview.settings_fingerprint.is_some() {
+    if preview.settings_fingerprint.is_some() || preview.action != EmbeddingSettingsAction::Build {
         return Err(AppError::InvalidInput(
             "A settings preview must use the atomic settings/build commit".into(),
         ));
@@ -96,8 +120,30 @@ pub async fn preview_settings_build(
     policy: DimensionPolicy,
     enabled_corpora: &[Corpus],
 ) -> Result<EmbeddingBuildPreview> {
-    let expected_revision = db.embedding_generation_control()?.revision;
-    let prepared = AiService::prepare_embedding_settings(db, input, policy, None).await?;
+    let control = db.embedding_generation_control()?;
+    let expected_revision = control.revision;
+    let pending_profile = control
+        .pending_id
+        .map(|generation| {
+            let status = db.embedding_generation_status(generation)?;
+            if !["paused", "failed", "interrupted"].contains(&status.state.as_str()) {
+                return Err(AppError::InvalidInput(
+                    "Stop the running candidate before changing its settings".into(),
+                ));
+            }
+            let stored = db.embedding_generation_corpus_status(generation)?;
+            if enabled_corpora
+                .iter()
+                .any(|corpus| !stored.iter().any(|row| row.corpus == *corpus && row.requested_enabled))
+            {
+                return Err(AppError::InvalidInput(
+                    "Candidate corpus selection cannot expand on resume; discard it and build a replacement".into(),
+                ));
+            }
+            db.embedding_generation_profile(generation)
+        })
+        .transpose()?;
+    let prepared = AiService::prepare_embedding_settings(db, input, policy, pending_profile.as_ref()).await?;
     check_format(&prepared.profile)?;
     if db.embedding_generation_control()?.revision != expected_revision {
         return Err(AppError::InvalidInput(
@@ -105,12 +151,79 @@ pub async fn preview_settings_build(
         ));
     }
     let settings_fingerprint = Some(settings_plan_fingerprint(&prepared.preference_writes)?);
+    // Feature switches may disable a requested corpus while paused. Preserve
+    // the immutable request; the resume transaction intersects live permissions.
+    let enabled_corpora = if let Some(generation) = control.pending_id {
+        db.embedding_generation_corpus_status(generation)?
+            .into_iter()
+            .filter(|row| row.requested_enabled)
+            .map(|row| row.corpus)
+            .collect()
+    } else {
+        enabled_corpora.to_vec()
+    };
     Ok(EmbeddingBuildPreview {
+        action: control
+            .pending_id
+            .map(|generation| EmbeddingSettingsAction::Resume { generation })
+            .unwrap_or_default(),
         expected_revision,
         opaque_identity: super::embedding_session::has_opaque_identity(&prepared.profile),
         profile: prepared.profile,
-        enabled_corpora: enabled_corpora.to_vec(),
+        enabled_corpora,
         settings_fingerprint,
+    })
+}
+
+fn check_requested_corpora(db: &Database, generation: i64, requested: &[Corpus]) -> Result<()> {
+    let stored = db.embedding_generation_corpus_status(generation)?;
+    if Corpus::ALL.into_iter().any(|corpus| {
+        requested.contains(&corpus) != stored.iter().any(|row| row.corpus == corpus && row.requested_enabled)
+    }) {
+        return Err(AppError::InvalidInput(
+            "Candidate corpus selection changed; discard it and build a replacement".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reauthorize the retained destination using only currently proposed settings,
+/// disclosure and newly supplied/current matching credentials. No generation is created.
+pub async fn preview_settings_rollback(
+    db: &Arc<Database>,
+    input: super::ai::AiSettingsInput,
+) -> Result<EmbeddingBuildPreview> {
+    let control = db.embedding_generation_control()?;
+    if control.pending_id.is_some() {
+        return Err(AppError::InvalidInput(
+            "Finish or discard the pending candidate before rollback".into(),
+        ));
+    }
+    let generation = control
+        .retained_id
+        .ok_or_else(|| AppError::InvalidInput("No retained index is available".into()))?;
+    let expected = db.embedding_generation_profile(generation)?;
+    check_format(&expected)?;
+    let prepared =
+        AiService::prepare_embedding_settings(db, input, expected.dimension_policy.clone(), Some(&expected)).await?;
+    if db.embedding_generation_control()?.revision != control.revision {
+        return Err(AppError::InvalidInput(
+            "AI settings changed during rollback preview".into(),
+        ));
+    }
+    let enabled_corpora = db
+        .embedding_generation_corpus_status(generation)?
+        .into_iter()
+        .filter(|row| row.requested_enabled)
+        .map(|row| row.corpus)
+        .collect();
+    Ok(EmbeddingBuildPreview {
+        action: EmbeddingSettingsAction::Rollback { generation },
+        expected_revision: control.revision,
+        opaque_identity: super::embedding_session::has_opaque_identity(&prepared.profile),
+        settings_fingerprint: Some(settings_plan_fingerprint(&prepared.preference_writes)?),
+        profile: prepared.profile,
+        enabled_corpora,
     })
 }
 
@@ -130,10 +243,27 @@ pub async fn commit_settings_build(
         ));
     }
     let control = db.embedding_generation_control()?;
-    if control.revision != preview.expected_revision || control.pending_id.is_some() {
+    let target_is_current = match preview.action {
+        EmbeddingSettingsAction::Build => control.pending_id.is_none(),
+        EmbeddingSettingsAction::Resume { generation } => control.pending_id == Some(generation),
+        EmbeddingSettingsAction::Rollback { generation } => {
+            control.pending_id.is_none() && control.retained_id == Some(generation)
+        }
+    };
+    if control.revision != preview.expected_revision || !target_is_current {
         return Err(AppError::InvalidInput(
             "AI settings changed or a build is pending; preview again".into(),
         ));
+    }
+    if let EmbeddingSettingsAction::Resume { generation } | EmbeddingSettingsAction::Rollback { generation } =
+        preview.action
+    {
+        if db.embedding_generation_profile(generation)?.fingerprint()? != preview.profile.fingerprint()? {
+            return Err(AppError::InvalidInput(
+                "Reused generation profile changed; preview again".into(),
+            ));
+        }
+        check_requested_corpora(db, generation, &preview.enabled_corpora)?;
     }
     let prepared = AiService::prepare_embedding_settings(db, input, policy, Some(&preview.profile)).await?;
     check_format(&prepared.profile)?;
@@ -155,12 +285,25 @@ pub async fn commit_settings_build(
     }
     let mut writes = prepared.preference_writes.clone();
     writes.extend(prepared.stage_credentials(db)?);
-    db.prepare_embedding_generation_with_preferences(
-        &prepared.profile,
-        &preview.enabled_corpora,
-        preview.expected_revision,
-        &writes,
-    )
+    match preview.action {
+        EmbeddingSettingsAction::Build => db.prepare_embedding_generation_with_preferences(
+            &prepared.profile,
+            &preview.enabled_corpora,
+            preview.expected_revision,
+            &writes,
+        ),
+        EmbeddingSettingsAction::Resume { generation } => db.resume_embedding_generation_with_preferences(
+            generation,
+            &prepared.profile.fingerprint()?,
+            preview.expected_revision,
+            &writes,
+        ),
+        EmbeddingSettingsAction::Rollback { .. } => db.prepare_embedding_rollback_with_preferences(
+            preview.expected_revision,
+            &prepared.profile.fingerprint()?,
+            &writes,
+        ),
+    }
 }
 
 fn settings_plan_fingerprint(writes: &[(String, Option<String>)]) -> Result<String> {
@@ -195,7 +338,7 @@ pub async fn rollback_build(db: &Arc<Database>, expected_revision: i64) -> Resul
     let server_endpoint_changed = profile.backend == super::ai_server::PROVIDER_ID
         && super::ai_server::load_server_settings(db)?.base_url != profile.endpoint;
     if selected_backend != profile.backend || server_endpoint_changed {
-        return Err(AppError::InvalidInput("Rollback requires explicitly selecting and authorizing the retained provider destination in AI settings. Confirm its disclosure and enter its current key if required; rollback never restores old keys or consent.".into()));
+        return Err(AppError::InvalidInput("Enter the retained destination and model in AI Settings, supply its current key or explicitly clear the key, then choose Rollback to preview and authorize it. Do not save a replacement first; rollback never restores old keys or consent.".into()));
     }
     let verified = AiService::probe_embedding_profile(db.clone(), &profile).await?;
     if verified.fingerprint()? != profile.fingerprint()? {
@@ -818,6 +961,372 @@ mod tests {
             Some(next.generation_id)
         );
         assert_eq!(db.embedding_generation_status(next.generation_id).unwrap().completed, 3);
+    }
+
+    #[tokio::test]
+    async fn settings_scope_is_committed_before_candidate_snapshot_with_missing_or_changed_defaults() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data":[{"index":0,"embedding":vec![0.1_f32;4096]}]})),
+            )
+            .mount(&server)
+            .await;
+        for changed in [false, true] {
+            let db = fixture();
+            db.connection().execute_batch("INSERT INTO emails(id,account_id,thread_id,subject,sender,sender_email,recipients_json,snippet,timestamp,created_at) VALUES('recent','a','recent-thread','Recent synthetic note','Fixture','sender@example.test','[]','Recent snippet',unixepoch(),unixepoch());").unwrap();
+            if changed {
+                db.set_preference("ai_max_email_count", "1000").unwrap();
+                db.set_preference("ai_max_email_age_days", "365").unwrap();
+            }
+            let (count, days) = if changed { (1, 30) } else { (1000, 365) };
+            // Deserialize the real boundary: old DTOs silently drop these fields.
+            let input: super::super::ai::AiSettingsInput = serde_json::from_value(serde_json::json!({
+                "provider":"openai_compatible", "model":"fixture-chat", "embeddingModel":"fixture-embedding", "monthlyBudgetUsd":0,
+                "maxEmailCount":count, "maxEmailAgeDays":days,
+                "server":{"baseUrl":format!("{}/v1", server.uri()), "embeddingSource":"server"}
+            })).unwrap();
+            let preview = preview_settings_build(&db, input.clone(), DimensionPolicy::Native, &[Corpus::Emails])
+                .await
+                .unwrap();
+            let changed_input = serde_json::json!({
+                "provider":"openai_compatible", "model":"fixture-chat", "embeddingModel":"fixture-embedding", "monthlyBudgetUsd":0,
+                "maxEmailCount":count + 1, "maxEmailAgeDays":days,
+                "server":{"baseUrl":format!("{}/v1", server.uri()), "embeddingSource":"server"}
+            });
+            let changed_input = serde_json::from_value(changed_input).unwrap();
+            assert!(
+                commit_settings_build(&db, changed_input, DimensionPolicy::Native, &preview)
+                    .await
+                    .is_err(),
+                "scope changes must invalidate preview"
+            );
+            let lease = commit_settings_build(&db, input, DimensionPolicy::Native, &preview)
+                .await
+                .unwrap();
+            assert_eq!(
+                db.get_preference("ai_max_email_count").unwrap(),
+                Some(count.to_string())
+            );
+            assert_eq!(
+                db.get_preference("ai_max_email_age_days").unwrap(),
+                Some(days.to_string())
+            );
+            db.embedding_build_is_current(&lease).unwrap();
+            let sources = db
+                .embedding_generation_sources(lease.generation_id, Corpus::Emails, 10)
+                .unwrap();
+            assert_eq!(sources.len(), if changed { 1 } else { 2 });
+            assert_eq!(run_build(&db, &lease).await.unwrap(), if changed { 1 } else { 2 });
+            assert_eq!(
+                db.embedding_generation_control().unwrap().active_id,
+                Some(lease.generation_id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_resume_preserves_requested_corpora_but_sends_no_disabled_sources() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data":[{"index":0,"embedding":vec![0.1_f32;4096]}]})),
+            )
+            .mount(&server)
+            .await;
+        let db = fixture();
+        let input = || super::super::ai::AiSettingsInput {
+            provider: "openai_compatible".into(),
+            model: "fixture-chat".into(),
+            embedding_model: Some("fixture-embedding".into()),
+            server: Some(super::super::ai_server::ServerSettingsInput {
+                base_url: format!("{}/v1", server.uri()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let preview = preview_settings_build(&db, input(), DimensionPolicy::Native, &Corpus::ALL)
+            .await
+            .unwrap();
+        let first = commit_settings_build(&db, input(), DimensionPolicy::Native, &preview)
+            .await
+            .unwrap();
+        let source = db
+            .embedding_source_snapshots(first.generation_id, Corpus::Emails, None, 1)
+            .unwrap()
+            .remove(0);
+        let inputs = source_inputs(&preview.profile, &source).unwrap();
+        let vectors = inputs.iter().map(|_| vec![0.1_f32; 4096]).collect::<Vec<_>>();
+        db.store_generation_embeddings(&first, &source.source, &inputs, &vectors)
+            .unwrap();
+        db.stop_embedding_generation(first.generation_id, false, None).unwrap();
+        db.set_preference("memory_enabled", "false").unwrap();
+        db.set_preference("help_docs_enabled", "false").unwrap();
+        let before = server.received_requests().await.unwrap().len();
+        let preview = preview_settings_build(&db, input(), DimensionPolicy::Native, &[Corpus::Emails])
+            .await
+            .unwrap();
+        assert_eq!(preview.enabled_corpora, Corpus::ALL);
+        let resumed = commit_settings_build(&db, input(), DimensionPolicy::Native, &preview)
+            .await
+            .unwrap();
+        assert_eq!(resumed.generation_id, first.generation_id);
+        assert_eq!(
+            db.embedding_generation_status(first.generation_id).unwrap().completed,
+            1
+        );
+        assert_eq!(run_build(&db, &resumed).await.unwrap(), 0);
+        for request in server.received_requests().await.unwrap().iter().skip(before) {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["input"], super::super::embedding_session::CANARY_TEXT);
+        }
+        let corpora = db.embedding_generation_corpus_status(first.generation_id).unwrap();
+        assert!(corpora
+            .iter()
+            .filter(|row| row.corpus != Corpus::Emails)
+            .all(|row| row.requested_enabled && !row.enabled));
+    }
+
+    #[tokio::test]
+    async fn settings_reenable_resumes_paused_candidate_without_losing_completed_vectors() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data":[{"index":0,"embedding":vec![0.1_f32;4096]}]})),
+            )
+            .mount(&server)
+            .await;
+        let db = fixture();
+        db.connection().execute_batch("INSERT INTO emails(id,account_id,thread_id,subject,sender,sender_email,recipients_json,snippet,timestamp,created_at) VALUES('second','a','second-thread','Second synthetic note','Fixture','sender@example.test','[]','Second snippet',unixepoch(),unixepoch());").unwrap();
+        let input = |model: &str| super::super::ai::AiSettingsInput {
+            provider: "openai_compatible".into(),
+            model: "fixture-chat".into(),
+            embedding_model: Some(model.into()),
+            server: Some(super::super::ai_server::ServerSettingsInput {
+                base_url: format!("{}/v1", server.uri()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let preview = preview_settings_build(
+            &db,
+            input("fixture-embedding"),
+            DimensionPolicy::Native,
+            &[Corpus::Emails],
+        )
+        .await
+        .unwrap();
+        let first = commit_settings_build(&db, input("fixture-embedding"), DimensionPolicy::Native, &preview)
+            .await
+            .unwrap();
+        let source = db
+            .embedding_source_snapshots(first.generation_id, Corpus::Emails, None, 1)
+            .unwrap()
+            .remove(0);
+        let inputs = source_inputs(&preview.profile, &source).unwrap();
+        let vectors = inputs.iter().map(|_| vec![0.1_f32; 4096]).collect::<Vec<_>>();
+        db.store_generation_embeddings(&first, &source.source, &inputs, &vectors)
+            .unwrap();
+        AiService::apply_embedding_opt_out(&db, input(""), db.embedding_generation_control().unwrap().revision)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.embedding_generation_status(first.generation_id).unwrap().completed,
+            1
+        );
+        assert!(
+            preview_settings_build(&db, input("fixture-embedding"), DimensionPolicy::Native, &Corpus::ALL)
+                .await
+                .is_err(),
+            "resume cannot expand the candidate corpus request"
+        );
+        let preview = preview_settings_build(
+            &db,
+            input("fixture-embedding"),
+            DimensionPolicy::Native,
+            &[Corpus::Emails],
+        )
+        .await
+        .unwrap();
+        let resumed = commit_settings_build(&db, input("fixture-embedding"), DimensionPolicy::Native, &preview)
+            .await
+            .unwrap();
+        assert_eq!(resumed.generation_id, first.generation_id);
+        assert_eq!(
+            db.embedding_generation_status(first.generation_id).unwrap().completed,
+            1
+        );
+        assert_eq!(run_build(&db, &resumed).await.unwrap(), 1);
+        assert_eq!(
+            db.embedding_generation_control().unwrap().active_id,
+            Some(first.generation_id)
+        );
+        assert_eq!(
+            db.embedding_generation_status(first.generation_id).unwrap().completed,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn proposed_settings_can_authorize_retained_destination_without_an_intermediate_generation() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let first_server = MockServer::start().await;
+        let second_server = MockServer::start().await;
+        for server in [&first_server, &second_server] {
+            Mock::given(method("POST"))
+                .and(path("/v1/embeddings"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"data":[{"index":0,"embedding":vec![0.1_f32;4096]}]})),
+                )
+                .mount(server)
+                .await;
+        }
+        let db = fixture();
+        let input = |server: &MockServer, key: &str| super::super::ai::AiSettingsInput {
+            provider: "openai_compatible".into(),
+            model: "fixture-chat".into(),
+            embedding_model: Some("fixture-embedding".into()),
+            server: Some(super::super::ai_server::ServerSettingsInput {
+                base_url: format!("{}/v1", server.uri()),
+                api_key: Some(key.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let preview = preview_settings_build(
+            &db,
+            input(&first_server, "fixture-first-key"),
+            DimensionPolicy::Native,
+            &[Corpus::Emails],
+        )
+        .await
+        .unwrap();
+        let first = commit_settings_build(
+            &db,
+            input(&first_server, "fixture-first-key"),
+            DimensionPolicy::Native,
+            &preview,
+        )
+        .await
+        .unwrap();
+        run_build(&db, &first).await.unwrap();
+        let preview = preview_settings_build(
+            &db,
+            input(&second_server, "fixture-second-key"),
+            DimensionPolicy::Native,
+            &[Corpus::Emails],
+        )
+        .await
+        .unwrap();
+        let second = commit_settings_build(
+            &db,
+            input(&second_server, "fixture-second-key"),
+            DimensionPolicy::Native,
+            &preview,
+        )
+        .await
+        .unwrap();
+        run_build(&db, &second).await.unwrap();
+        assert_eq!(
+            db.embedding_generation_control().unwrap().retained_id,
+            Some(first.generation_id)
+        );
+        assert!(rollback_build(&db, db.embedding_generation_control().unwrap().revision)
+            .await
+            .is_err());
+        let before = db.embedding_generation_control().unwrap();
+        let requests_before = first_server.received_requests().await.unwrap().len();
+        let mut without_key = input(&first_server, "fixture-current-reauthorized-key");
+        without_key.server.as_mut().unwrap().api_key = None;
+        assert!(
+            preview_settings_rollback(&db, without_key).await.is_err(),
+            "never send the current destination's key to a retained destination"
+        );
+        assert_eq!(first_server.received_requests().await.unwrap().len(), requests_before);
+        assert_eq!(
+            super::super::ai_server::load_api_key(&db).unwrap(),
+            "fixture-second-key"
+        );
+        assert_eq!(
+            db.embedding_generation_control().unwrap().retained_id,
+            before.retained_id
+        );
+        let preview = preview_settings_rollback(&db, input(&first_server, "fixture-current-reauthorized-key"))
+            .await
+            .unwrap();
+        db.connection().execute_batch("CREATE TEMP TRIGGER reject_fixture_rollback BEFORE UPDATE OF state ON embedding_generations WHEN NEW.state='building' BEGIN SELECT RAISE(ABORT,'synthetic rollback failure'); END;").unwrap();
+        assert!(commit_settings_build(
+            &db,
+            input(&first_server, "fixture-current-reauthorized-key"),
+            DimensionPolicy::Native,
+            &preview
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            super::super::ai_server::load_api_key(&db).unwrap(),
+            "fixture-second-key"
+        );
+        assert_eq!(
+            super::super::ai_server::load_server_settings(&db).unwrap().base_url,
+            Some(format!("{}/v1", second_server.uri()))
+        );
+        assert_eq!(db.embedding_generation_control().unwrap().revision, before.revision);
+        assert_eq!(db.embedding_generation_control().unwrap().active_id, before.active_id);
+        assert_eq!(
+            db.embedding_generation_control().unwrap().retained_id,
+            before.retained_id
+        );
+        db.connection()
+            .execute_batch("DROP TRIGGER reject_fixture_rollback")
+            .unwrap();
+        let rollback = commit_settings_build(
+            &db,
+            input(&first_server, "fixture-current-reauthorized-key"),
+            DimensionPolicy::Native,
+            &preview,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rollback.generation_id, first.generation_id);
+        assert_eq!(
+            db.reader()
+                .query_row("SELECT count(*) FROM embedding_generations WHERE id>0", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            super::super::ai_server::load_api_key(&db).unwrap(),
+            "fixture-current-reauthorized-key"
+        );
+        run_build(&db, &rollback).await.unwrap();
+        assert_eq!(
+            db.embedding_generation_control().unwrap().active_id,
+            Some(first.generation_id)
+        );
     }
 
     #[tokio::test]

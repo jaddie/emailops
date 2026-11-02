@@ -1363,3 +1363,429 @@ fn junk_feedback_invalidates_all_managed_generations_and_fences_late_results() {
         0
     );
 }
+
+#[test]
+fn lifecycle_poll_recovers_fast_restart_only_after_lease_expiry() {
+    use crate::services::clock::{Clock, FixedClock};
+    let (dir, db) = file_db();
+    seed(&db.connection());
+    let lease = prepare(&db, 768);
+    populate(&db, &lease, 768);
+    let deadline: i64 = db
+        .reader()
+        .query_row(
+            "SELECT lease_until FROM embedding_generations WHERE id=?1",
+            [lease.generation_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let reopened = Database::new(dir.path().to_path_buf()).unwrap();
+    let clock = FixedClock::new(deadline - 1);
+    assert_eq!(
+        reopened
+            .embedding_generation_status_at(lease.generation_id, clock.now_secs())
+            .unwrap()
+            .state,
+        "building"
+    );
+    clock.advance_secs(2);
+    let status = reopened
+        .embedding_generation_status_at(lease.generation_id, clock.now_secs())
+        .unwrap();
+    assert_eq!(status.state, "interrupted");
+    assert!(status.epoch > lease.epoch);
+    assert_eq!(status.completed, 3);
+    assert!(reopened.heartbeat_embedding_generation(&lease).is_err());
+    assert_eq!(
+        reopened.embedding_generation_control().unwrap().pending_id,
+        Some(lease.generation_id)
+    );
+}
+
+#[test]
+fn repeated_activation_collects_only_obsolete_retained_generations() {
+    let (_dir, db) = file_db();
+    seed(&db.connection());
+    let mut previous = None;
+    for dimensions in [768, 2560, 4096, 768] {
+        let lease = prepare(&db, dimensions);
+        populate(&db, &lease, dimensions);
+        activate(&db, &lease);
+        let control = db.embedding_generation_control().unwrap();
+        assert_eq!(control.active_id, Some(lease.generation_id));
+        assert_eq!(control.retained_id, previous);
+        assert_eq!(
+            count(&db, "embedding_generations"),
+            if previous.is_some() { 3 } else { 2 }
+        );
+        let managed_tables:i64=db.reader().query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name GLOB 'vec_*_g[0-9]*' AND sql LIKE 'CREATE VIRTUAL TABLE%'",[],|r|r.get(0)).unwrap();
+        assert_eq!(managed_tables, if previous.is_some() { 6 } else { 3 });
+        previous = Some(lease.generation_id);
+    }
+}
+
+#[test]
+fn obsolete_cleanup_delete_failure_rolls_back_and_can_be_retried_without_revision_change() {
+    let (_dir, db) = file_db();
+    seed(&db.connection());
+    let first = prepare(&db, 768);
+    populate(&db, &first, 768);
+    activate(&db, &first);
+    let second = prepare(&db, 2560);
+    populate(&db, &second, 2560);
+    activate(&db, &second);
+    let third = prepare(&db, 4096);
+    populate(&db, &third, 4096);
+    db.connection().execute_batch("CREATE TEMP TRIGGER reject_obsolete_delete BEFORE DELETE ON embedding_generations BEGIN SELECT RAISE(ABORT,'synthetic cleanup delete failure'); END;").unwrap();
+    activate(&db, &third);
+    let before = db.embedding_generation_control().unwrap();
+    assert_eq!(before.active_id, Some(third.generation_id));
+    assert_eq!(before.retained_id, Some(second.generation_id));
+    assert!(db.cleanup_obsolete_embedding_generations().is_err());
+    assert_eq!(count(&db, "embedding_generations"), 4);
+    assert_eq!(
+        count(&db, &vector_table(first.generation_id, Corpus::Emails).unwrap()),
+        1
+    );
+    let triggers: i64 = db
+        .reader()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [format!(
+                "invalidate_{}",
+                vector_table(first.generation_id, Corpus::Emails).unwrap()
+            )],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(triggers, 1, "DDL rollback restores the invalidation trigger too");
+    db.connection()
+        .execute_batch("DROP TRIGGER reject_obsolete_delete;")
+        .unwrap();
+    assert_eq!(db.cleanup_obsolete_embedding_generations().unwrap(), 1);
+    assert_eq!(db.embedding_generation_control().unwrap(), before);
+    assert!(db.embedding_generation_status(first.generation_id).is_err());
+    assert_eq!(
+        db.embedding_generation_status(second.generation_id).unwrap().state,
+        "retained"
+    );
+    assert_eq!(
+        db.embedding_generation_status(third.generation_id).unwrap().state,
+        "active"
+    );
+}
+
+#[test]
+fn obsolete_cleanup_drop_failure_preserves_active_and_rollback() {
+    use std::ffi::{c_char, c_int, c_void};
+    unsafe extern "C" fn deny_drop(
+        _ctx: *mut c_void,
+        action: c_int,
+        _first: *const c_char,
+        _second: *const c_char,
+        _db: *const c_char,
+        _cause: *const c_char,
+    ) -> c_int {
+        if action == rusqlite::ffi::SQLITE_DROP_VTABLE || action == rusqlite::ffi::SQLITE_DROP_TABLE {
+            rusqlite::ffi::SQLITE_DENY
+        } else {
+            rusqlite::ffi::SQLITE_OK
+        }
+    }
+    let (_dir, db) = file_db();
+    seed(&db.connection());
+    let first = prepare(&db, 768);
+    populate(&db, &first, 768);
+    activate(&db, &first);
+    let second = prepare(&db, 2560);
+    populate(&db, &second, 2560);
+    activate(&db, &second);
+    let third = prepare(&db, 4096);
+    populate(&db, &third, 4096);
+    {
+        let conn = db.connection();
+        // Test-owned connection and static callback; no callback data is dereferenced.
+        assert_eq!(
+            unsafe { rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), Some(deny_drop), std::ptr::null_mut()) },
+            rusqlite::ffi::SQLITE_OK
+        );
+    }
+    activate(&db, &third);
+    assert!(db.cleanup_obsolete_embedding_generations().is_err());
+    assert_eq!(
+        db.embedding_generation_status(third.generation_id).unwrap().state,
+        "active"
+    );
+    assert_eq!(
+        db.embedding_generation_status(second.generation_id).unwrap().state,
+        "retained"
+    );
+    assert_eq!(
+        count(&db, &vector_table(first.generation_id, Corpus::Emails).unwrap()),
+        1
+    );
+    {
+        let conn = db.connection();
+        // Remove the test-only authorizer on the same live connection.
+        assert_eq!(
+            unsafe { rusqlite::ffi::sqlite3_set_authorizer(conn.handle(), None, std::ptr::null_mut()) },
+            rusqlite::ffi::SQLITE_OK
+        );
+    }
+    assert_eq!(db.cleanup_obsolete_embedding_generations().unwrap(), 1);
+}
+
+#[test]
+fn obsolete_cleanup_skips_pending_validation_without_changing_schema() {
+    let (_dir, db) = file_db();
+    seed(&db.connection());
+    let first = prepare(&db, 768);
+    populate(&db, &first, 768);
+    activate(&db, &first);
+    let second = prepare(&db, 2560);
+    populate(&db, &second, 2560);
+    activate(&db, &second);
+    let third = prepare(&db, 4096);
+    populate(&db, &third, 4096);
+    db.connection().execute_batch("CREATE TEMP TRIGGER reject_obsolete_delete BEFORE DELETE ON embedding_generations BEGIN SELECT RAISE(ABORT,'retain obsolete for pending guard test'); END;").unwrap();
+    activate(&db, &third);
+    db.connection()
+        .execute_batch("DROP TRIGGER reject_obsolete_delete;")
+        .unwrap();
+    let pending = prepare(&db, 768);
+    populate(&db, &pending, 768);
+    db.validate_embedding_generation(&pending).unwrap();
+    let before = db.embedding_generation_control().unwrap();
+    let schema: i64 = db
+        .reader()
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(db.cleanup_obsolete_embedding_generations().unwrap(), 0);
+    assert_eq!(
+        db.reader()
+            .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        schema
+    );
+    assert_eq!(db.embedding_generation_control().unwrap(), before);
+    db.activate_embedding_generation(&pending).unwrap();
+    assert_eq!(count(&db, "embedding_generations"), 3);
+}
+
+#[test]
+fn file_reader_keeps_obsolete_vector_snapshot_during_post_activation_cleanup() {
+    let (dir, db) = file_db();
+    seed(&db.connection());
+    let first = prepare(&db, 768);
+    populate(&db, &first, 768);
+    activate(&db, &first);
+    let other = Database::new(dir.path().to_path_buf()).unwrap();
+    let mut reader = other.reader();
+    let snapshot = reader.transaction().unwrap();
+    assert_eq!(control(&snapshot).unwrap().active_id, Some(first.generation_id));
+    let table = vector_table(first.generation_id, Corpus::Emails).unwrap();
+    let probe: Vec<u8> = vector(768, 0).iter().flat_map(|n| n.to_le_bytes()).collect();
+    let search = |conn: &Connection| {
+        conn.query_row(
+            &format!("SELECT count(*) FROM (SELECT rowid FROM {table} WHERE embedding MATCH ?1 AND k=1)"),
+            [&probe],
+            |r| r.get::<_, i64>(0),
+        )
+    };
+    assert_eq!(search(&snapshot).unwrap(), 1);
+    for dimensions in [2560, 4096] {
+        let next = prepare(&db, dimensions);
+        populate(&db, &next, dimensions);
+        activate(&db, &next);
+    }
+    assert_eq!(count(&db, "embedding_generations"), 3);
+    assert_eq!(control(&snapshot).unwrap().active_id, Some(first.generation_id));
+    assert_eq!(
+        search(&snapshot).unwrap(),
+        1,
+        "pinned sqlite-vec must preserve an old reader across DROP on another connection"
+    );
+    assert_eq!(
+        snapshot
+            .query_row(
+                "SELECT count(*) FROM embedding_generation_chunks WHERE generation_id=?1",
+                [first.generation_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        3
+    );
+    snapshot.commit().unwrap();
+    assert!(
+        search(&reader).is_err(),
+        "new snapshots no longer expose the collected table"
+    );
+}
+
+#[test]
+fn resume_with_preferences_is_atomic_and_preserves_complete_sources() {
+    let (_dir, db) = file_db();
+    seed(&db.connection());
+    let active = prepare(&db, 768);
+    populate(&db, &active, 768);
+    activate(&db, &active);
+    let pending = prepare(&db, 4096);
+    populate(&db, &pending, 4096);
+    db.stop_embedding_generation(pending.generation_id, false, None)
+        .unwrap();
+    db.apply_embedding_opt_out_preferences(
+        db.embedding_generation_control().unwrap().revision,
+        &[("ai_embedding_model".into(), Some("".into()))],
+    )
+    .unwrap();
+    let revision = db.embedding_generation_control().unwrap().revision;
+    let writes = vec![
+        ("ai_embedding_model".into(), Some(profile(4096).model)),
+        (
+            "openai_compatible_api_key_id".into(),
+            Some("fresh-authorized-key".into()),
+        ),
+    ];
+    assert!(db
+        .resume_embedding_generation_with_preferences(
+            pending.generation_id,
+            &pending.fingerprint,
+            revision - 1,
+            &writes
+        )
+        .is_err());
+    db.connection().execute_batch("CREATE TEMP TRIGGER reject_resume BEFORE UPDATE OF state ON embedding_generations WHEN old.state='paused' AND new.state='building' BEGIN SELECT RAISE(ABORT,'synthetic resume failure'); END;").unwrap();
+    assert!(db
+        .resume_embedding_generation_with_preferences(pending.generation_id, &pending.fingerprint, revision, &writes)
+        .is_err());
+    assert_eq!(db.get_preference("ai_embedding_model").unwrap().as_deref(), Some(""));
+    assert!(db.get_preference("openai_compatible_api_key_id").unwrap().is_none());
+    assert_eq!(
+        db.embedding_generation_status(pending.generation_id).unwrap().completed,
+        3
+    );
+    assert_eq!(
+        db.embedding_generation_status(pending.generation_id).unwrap().state,
+        "paused"
+    );
+    db.connection().execute_batch("DROP TRIGGER reject_resume;").unwrap();
+    let resumed = db
+        .resume_embedding_generation_with_preferences(pending.generation_id, &pending.fingerprint, revision, &writes)
+        .unwrap();
+    assert!(resumed.epoch > pending.epoch);
+    assert_ne!(resumed.owner, pending.owner);
+    assert!(db.heartbeat_embedding_generation(&pending).is_err());
+    db.heartbeat_embedding_generation(&resumed).unwrap();
+    assert_eq!(
+        db.embedding_generation_status(resumed.generation_id).unwrap().completed,
+        3
+    );
+    assert_eq!(
+        db.embedding_generation_control().unwrap().active_id,
+        Some(active.generation_id)
+    );
+    let query = TypedQueryEmbedding::new(
+        db.active_embedding_write_lease().unwrap().unwrap(),
+        &profile(768),
+        "query",
+        vector(768, 0),
+    )
+    .unwrap();
+    assert_eq!(
+        db.search_generation_vectors(&query, "query", Corpus::Emails, Some("account-a"), &[], None, 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    activate(&db, &resumed);
+}
+
+#[test]
+fn rollback_with_proposed_preferences_never_restores_old_credentials_and_rolls_back_failure() {
+    let (_dir, db) = file_db();
+    seed(&db.connection());
+    let mut old_profile = profile(768);
+    old_profile.endpoint = Some("http://localhost:1/v1".into());
+    let first = db
+        .prepare_embedding_generation(
+            &old_profile,
+            &Corpus::ALL,
+            db.embedding_generation_control().unwrap().revision,
+        )
+        .unwrap();
+    populate(&db, &first, 768);
+    activate(&db, &first);
+    let mut new_profile = profile(4096);
+    new_profile.endpoint = Some("http://localhost:2/v1".into());
+    let second = db
+        .prepare_embedding_generation(
+            &new_profile,
+            &Corpus::ALL,
+            db.embedding_generation_control().unwrap().revision,
+        )
+        .unwrap();
+    populate(&db, &second, 4096);
+    activate(&db, &second);
+    db.set_preference("openai_compatible_base_url", "http://localhost:2/v1")
+        .unwrap();
+    db.set_preference("openai_compatible_api_key_id", "current-B-key-reference")
+        .unwrap();
+    let revision = db.embedding_generation_control().unwrap().revision;
+    let writes = vec![
+        (
+            "openai_compatible_base_url".into(),
+            Some("http://localhost:1/v1".into()),
+        ),
+        (
+            "openai_compatible_api_key_id".into(),
+            Some("fresh-explicit-A-key-reference".into()),
+        ),
+    ];
+    assert!(db
+        .prepare_embedding_rollback_with_preferences(revision, "wrong fingerprint", &writes)
+        .is_err());
+    db.connection().execute_batch("CREATE TEMP TRIGGER reject_rollback BEFORE UPDATE OF state ON embedding_generations WHEN old.state='retained' AND new.state='building' BEGIN SELECT RAISE(ABORT,'synthetic rollback failure'); END;").unwrap();
+    assert!(db
+        .prepare_embedding_rollback_with_preferences(revision, &first.fingerprint, &writes)
+        .is_err());
+    assert_eq!(
+        db.get_preference("openai_compatible_base_url").unwrap().as_deref(),
+        Some("http://localhost:2/v1")
+    );
+    assert_eq!(
+        db.get_preference("openai_compatible_api_key_id").unwrap().as_deref(),
+        Some("current-B-key-reference")
+    );
+    assert_eq!(
+        db.embedding_generation_control().unwrap().active_id,
+        Some(second.generation_id)
+    );
+    assert_eq!(
+        db.embedding_generation_control().unwrap().retained_id,
+        Some(first.generation_id)
+    );
+    db.connection().execute_batch("DROP TRIGGER reject_rollback;").unwrap();
+    let rollback = db
+        .prepare_embedding_rollback_with_preferences(revision, &first.fingerprint, &writes)
+        .unwrap();
+    assert_eq!(
+        db.get_preference("openai_compatible_api_key_id").unwrap().as_deref(),
+        Some("fresh-explicit-A-key-reference")
+    );
+    assert_eq!(
+        db.embedding_generation_status(rollback.generation_id)
+            .unwrap()
+            .completed,
+        3
+    );
+    assert_eq!(
+        db.embedding_generation_control().unwrap().pending_id,
+        Some(first.generation_id)
+    );
+    activate(&db, &rollback);
+    assert_eq!(
+        db.embedding_generation_control().unwrap().active_id,
+        Some(first.generation_id)
+    );
+}

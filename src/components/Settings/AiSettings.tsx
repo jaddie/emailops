@@ -126,6 +126,9 @@ export function AiSettings() {
   const [dimensionPolicy, setDimensionPolicy] = useState<api.EmbeddingDimensionPolicy>({ Explicit: 768 });
   const savedEmbeddingConfigRef = useRef('');
   const forceEmbeddingBuildRef = useRef(false);
+  const settingsActionRef = useRef<
+    { kind: 'resume'; model: string; policy: api.EmbeddingDimensionPolicy } | { kind: 'rollback' } | null
+  >(null);
   const savedPolicyRef = useRef<api.EmbeddingDimensionPolicy>({ Explicit: 768 });
   const [testing, setTesting] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -476,6 +479,7 @@ export function AiSettings() {
     if (config.provider === 'openrouter' && config.model.trim() === '') {
       setError(t('settings:openRouter.chatModelRequired'));
       forceEmbeddingBuildRef.current = false;
+      settingsActionRef.current = null;
       return;
     }
     acceptedHostRef.current = null;
@@ -483,11 +487,13 @@ export function AiSettings() {
       if (config.server.baseUrl.trim() === '') {
         setError(t('settings:server.baseUrlRequired'));
         forceEmbeddingBuildRef.current = false;
+        settingsActionRef.current = null;
         return;
       }
       if (config.model.trim() === '') {
         setError(t('settings:server.chatModelRequired'));
         forceEmbeddingBuildRef.current = false;
+        settingsActionRef.current = null;
         return;
       }
       // Mail is about to go to another machine: say so before anything else.
@@ -552,22 +558,27 @@ export function AiSettings() {
             }
           : undefined;
 
+      const settingsAction = settingsActionRef.current;
+      const effectivePolicy = settingsAction?.kind === 'resume' ? settingsAction.policy : dimensionPolicy;
       const input: api.EmbeddingSettingsInput = {
         provider: config.provider,
         model: config.model,
-        embeddingModel: config.embeddingModel,
+        embeddingModel: settingsAction?.kind === 'resume' ? settingsAction.model : config.embeddingModel,
         apiKey: key,
         monthlyBudgetUsd: config.monthlyBudgetUsd,
         thinkingEnabled: config.thinkingEnabled,
         zeroDataRetention: config.zeroDataRetention,
         server: server ?? null,
+        maxEmailCount: Number.isFinite(aiMaxEmailCount) ? Math.max(0, Math.round(aiMaxEmailCount)) : 1000,
+        maxEmailAgeDays: Number.isFinite(aiMaxEmailAgeDays) ? Math.max(0, Math.round(aiMaxEmailAgeDays)) : 365,
       };
       const embeddingChanged =
         savedEmbeddingConfigRef.current !== embeddingIdentity(config.provider, config.embeddingModel, config.server) ||
         JSON.stringify(dimensionPolicy) !== JSON.stringify(savedPolicyRef.current);
-      const build = forceEmbeddingBuildRef.current || embeddingChanged;
+      const build = settingsAction !== null || forceEmbeddingBuildRef.current || embeddingChanged;
       forceEmbeddingBuildRef.current = false;
-      if (build && !config.embeddingModel.trim()) {
+      settingsActionRef.current = null;
+      if (build && !input.embeddingModel?.trim()) {
         const lifecycle = await api.getEmbeddingLifecycle();
         setConfirmEmbeddingOptOut(true);
         const confirmed = await new Promise<boolean>((resolve) => {
@@ -578,7 +589,10 @@ export function AiSettings() {
       } else if (build) {
         let preview: api.EmbeddingBuildPreview;
         try {
-          preview = await api.previewEmbeddingSettings(input, dimensionPolicy);
+          preview =
+            settingsAction?.kind === 'rollback'
+              ? await api.previewEmbeddingSettings(input, effectivePolicy, true)
+              : await api.previewEmbeddingSettings(input, effectivePolicy);
         } catch (err) {
           if (config.zeroDataRetention && isDataPolicyError(err)) {
             setError(t('settings:openRouter.embeddingZdrBlocked', { model: config.embeddingModel }));
@@ -591,7 +605,7 @@ export function AiSettings() {
           buildDecisionRef.current = resolve;
         });
         if (!confirmed) return;
-        await api.commitEmbeddingSettings(input, dimensionPolicy, preview);
+        await api.commitEmbeddingSettings(input, preview.profile.dimension_policy ?? effectivePolicy, preview);
       } else {
         await api.setAiConfig(
           config.provider,
@@ -602,9 +616,11 @@ export function AiSettings() {
           config.thinkingEnabled,
           config.zeroDataRetention,
           server,
+          input.maxEmailCount ?? undefined,
+          input.maxEmailAgeDays ?? undefined,
         );
       }
-      savedEmbedModelRef.current = config.embeddingModel;
+      savedEmbedModelRef.current = input.embeddingModel ?? '';
       setServerApiKey('');
       setClearServerKey(false);
 
@@ -625,22 +641,6 @@ export function AiSettings() {
         await api.setPref('chat.keep_alive_seconds', String(secs));
       } catch (err) {
         addLog('error', 'ai', t('settings:ai.keepAliveSaveFailed', { error: errorText(err) }));
-      }
-
-      // Save AI processing email-count limit. Clamp negatives.
-      try {
-        const count = Number.isFinite(aiMaxEmailCount) ? Math.max(0, Math.round(aiMaxEmailCount)) : 1000;
-        await api.setPref('ai_max_email_count', String(count));
-      } catch (err) {
-        addLog('error', 'ai', t('settings:ai.emailCountCutoffSaveFailed', { error: errorText(err) }));
-      }
-
-      // Save AI processing age cutoff (days). 0 = no limit; clamp negatives.
-      try {
-        const days = Number.isFinite(aiMaxEmailAgeDays) ? Math.max(0, Math.round(aiMaxEmailAgeDays)) : 365;
-        await api.setPref('ai_max_email_age_days', String(days));
-      } catch (err) {
-        addLog('error', 'ai', t('settings:ai.ageCutoffSaveFailed', { error: errorText(err) }));
       }
 
       // Save context window (tokens) for the embedded model. Clamp to the
@@ -805,6 +805,14 @@ export function AiSettings() {
           onPolicy={setDimensionPolicy}
           onBuild={() => {
             forceEmbeddingBuildRef.current = true;
+            handleSave();
+          }}
+          onResume={(model, policy) => {
+            settingsActionRef.current = { kind: 'resume', model, policy };
+            handleSave();
+          }}
+          onRollback={() => {
+            settingsActionRef.current = { kind: 'rollback' };
             handleSave();
           }}
           busy={saving}
@@ -974,6 +982,7 @@ export function AiSettings() {
           activity={workInProgress.activity}
           onCancel={() => {
             forceEmbeddingBuildRef.current = false;
+            settingsActionRef.current = null;
             setWorkInProgress(null);
           }}
           onProceed={() => {
@@ -1006,6 +1015,7 @@ export function AiSettings() {
           host={disclosure}
           onCancel={() => {
             forceEmbeddingBuildRef.current = false;
+            settingsActionRef.current = null;
             setDisclosure(null);
           }}
           onConfirm={() => {
